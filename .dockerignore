@@ -1,0 +1,12 @@
+.git
+.github
+.venv
+cache/
+__pycache__/
+*.pyc
+*.png
+*.svg
+*.R
+*.jl
+*.sh
+*.md

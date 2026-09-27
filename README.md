@@ -197,6 +197,31 @@ printf 'TELEGRAM_BOT_TOKEN=%s\n' 'NEW_TOKEN' > ~/.config/weather-sounding-bot.en
 systemctl --user restart weather-sounding-bot
 ```
 
+### Running it in a container
+
+Every push to `main` publishes an amd64 + arm64 image to
+`ghcr.io/mguzhou/socal_soaring_weather_tools` (`latest`, plus
+`sha-<commit>`), built by `.github/workflows/docker.yml`:
+
+```bash
+docker run -d --name sounding-bot --restart unless-stopped \
+  -e TELEGRAM_BOT_TOKEN="$TOKEN" \
+  -v sounding-data:/data \
+  ghcr.io/mguzhou/socal_soaring_weather_tools:latest
+```
+
+In the image, the cache and rendered PNG/SVGs live under `/data` and the
+site list is `sites.tsv` from this repo. The paths are set by
+`SOUNDING_CACHE_DIR`, `SOUNDING_OUTPUT_DIR` and `SOUNDING_SITES_FILE`,
+which default to the usual locations when unset. Nothing prunes `/data`,
+so it grows by roughly 900 MB per model run fetched.
+
+The image uses Debian's `libeccodes` rather than the `eccodeslib` wheel.
+That wheel's `eckitlib` dependency bundles its own `libproj`/`libsqlite3`,
+and on Linux, loading it alongside pyproj's copies crashes
+(`double free or corruption`) when `eccodes` is imported before
+`metpy.calc`, as `grib.py` does.
+
 ## Batch runs
 
 - `interesting.sh` — a fixed list of past dates, observed soundings.

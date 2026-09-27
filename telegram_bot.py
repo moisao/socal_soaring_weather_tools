@@ -46,7 +46,11 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 SCRIPT_DIR = Path(__file__).parent
-SITES_FILE = SCRIPT_DIR.parent / 'sites.tsv'
+# Overridable so a container can keep the site list in a mounted config
+# file and write renders to a volume rather than next to the code.
+SITES_FILE = Path(os.environ.get('SOUNDING_SITES_FILE') or SCRIPT_DIR.parent / 'sites.tsv')
+OUTPUT_DIR = Path(os.environ.get('SOUNDING_OUTPUT_DIR') or SCRIPT_DIR)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # matplotlib's pyplot is global, mutable state, so two renders must never
 # overlap -- concurrent requests queue here instead. Rendering in-process
@@ -140,7 +144,7 @@ def _render(argv: list) -> Path:
             message = complaint[-1].split('error: ', 1)[-1] if complaint else 'invalid arguments'
             raise BadArguments(message) from None
         try:
-            stub = Simple_Sounding.main(args, output_dir=SCRIPT_DIR)
+            stub = Simple_Sounding.main(args, output_dir=OUTPUT_DIR)
         finally:
             # The decoded-field memo pays off across sites in one batch;
             # here each request is usually a different run, so it would

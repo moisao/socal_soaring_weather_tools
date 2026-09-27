@@ -4,6 +4,7 @@ needs.
 Deliberately free of project imports, so every other module can
 import this without any risk of an import cycle."""
 
+import os
 from datetime import timedelta
 from pathlib import Path
 
@@ -47,5 +48,6 @@ KM_TO_KFT = 3.280839895
 
 # Cache fetched soundings locally so re-running the script (e.g. while
 # tweaking the plot) doesn't have to hit the Wyoming archive every time.
-CACHE_DIR = Path(__file__).parent / 'cache'
-CACHE_DIR.mkdir(exist_ok=True)
+# SOUNDING_CACHE_DIR moves it onto a mounted volume when containerised.
+CACHE_DIR = Path(os.environ.get('SOUNDING_CACHE_DIR') or Path(__file__).parent / 'cache')
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
