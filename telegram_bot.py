@@ -201,6 +201,17 @@ async def _render_and_reply(update: Update, argv: list, timeout: int, label: str
 
 async def sounding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
+    # A named site is a flying site, not a radiosonde launch station: there
+    # is no observed sounding for it, so the Wyoming lookup below would only
+    # come back empty ("No recent sounding data") -- or, for a two-word name,
+    # read its second word as a bad datetime. Point at /site instead,
+    # keeping any datetime that was given.
+    match, remaining = match_site(args)
+    if match is not None:
+        suggestion = ' '.join(['/site', match[0], *remaining])
+        await update.message.reply_text(f'Command failed: Did you mean {suggestion}?')
+        return
+
     station = args[0] if len(args) >= 1 else 'NKX'
     argv = ['--station', station]
     if len(args) >= 2:
@@ -251,8 +262,8 @@ async def post_init(application: Application) -> None:
     # commands there may need "@YourBotUsername" if another bot in the
     # same group also defines the same command name).
     await application.bot.set_my_commands([
-        BotCommand('sounding', 'Skew-T sounding: /sounding [station] [datetime]'),
-        BotCommand('site', 'Named-site sounding: /site <name> [datetime]'),
+        BotCommand('sounding', 'Observed radiosonde: /sounding [station] [datetime]'),
+        BotCommand('site', 'Modeled sounding at a site: /site <name> [datetime]'),
         BotCommand('sites', 'List named sites (from sites.tsv)'),
     ])
 
