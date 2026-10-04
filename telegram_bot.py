@@ -3,11 +3,15 @@
 Usage (in a chat with the bot):
     /sounding                      -> latest NKX sounding
     /sounding 72572                -> latest sounding for station 72572
-    /sounding NKX 2025-01-01T12    -> that station's sounding at that run
+    /sounding NKX 2025-07-01T17    -> that station's 00Z launch (5pm PDT)
 
     /sites                          -> list named sites (from sites.tsv)
-    /site Little Black              -> latest modeled sounding at that site
-    /site Little Black 2026-09-17T19 -> that site's sounding at that time
+    /site Little Black              -> modeled sounding at that site, this hour
+    /site Little Black 14           -> ... at 2pm today
+    /site Little Black 2026-09-17T12 -> ... at that time
+
+Times are local (SOUNDING_TIMEZONE, default America/Los_Angeles) unless
+they say otherwise -- "2026-09-17T19Z" or "21Z" are UTC.
 
 Setup:
     export TELEGRAM_BOT_TOKEN="<token from @BotFather>"
@@ -29,8 +33,11 @@ import logging
 import os
 import re
 import threading
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
+from dateutil import parser as dateutil_parser
 from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -56,6 +63,10 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # Earlier renders, re-sent while still current instead of fetched and
 # drawn again -- see replay.py.
 REPLAY = ReplayIndex(OUTPUT_DIR / 'replay-index')
+# The zone times typed into chat are read in. The command line keeps
+# reading bare times as UTC (cli.parse_datetime); people in a chat think
+# in local time, and "2pm" shouldn't need converting to 21Z first.
+LOCAL_TZ = ZoneInfo(os.environ.get('SOUNDING_TIMEZONE') or 'America/Los_Angeles')
 
 # matplotlib's pyplot is global, mutable state, so two renders must never
 # overlap -- concurrent requests queue here instead. Rendering in-process
@@ -120,6 +131,27 @@ def match_site(args):
             if name.lower() == candidate:
                 return (name, lat, lon), args[n:]
     return None, args
+
+
+def chat_datetime(text):
+    """A time typed into chat, as an ISO string with an explicit offset
+    for --datetime: read in LOCAL_TZ unless it names its own zone, with
+    missing fields taken from the current local hour. A bare hour ("14")
+    means that hour today, and "21Z" that hour in UTC -- dateutil alone
+    would read "14" as the 14th of the month. Anything unparseable is
+    passed through untouched, for argparse to reject with its usual
+    "Invalid date/time" message."""
+    now = datetime.now(LOCAL_TZ).replace(minute=0, second=0, microsecond=0)
+    m = re.fullmatch(r'(\d{1,2})([zZ]?)', text.strip())
+    if m and int(m.group(1)) < 24:
+        if m.group(2):
+            return now.astimezone(ZoneInfo('UTC')).replace(hour=int(m.group(1))).isoformat()
+        return now.replace(hour=int(m.group(1))).isoformat()
+    try:
+        dt = dateutil_parser.parse(text, default=now.replace(tzinfo=None))
+    except (ValueError, OverflowError):
+        return text
+    return (dt if dt.tzinfo else dt.replace(tzinfo=LOCAL_TZ)).isoformat()
 
 
 class BadArguments(Exception):
@@ -201,10 +233,21 @@ async def _render_and_reply(update: Update, argv: list, timeout: int, label: str
 
 async def sounding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
+    # A named site is a flying site, not a radiosonde launch station: there
+    # is no observed sounding for it, so the Wyoming lookup below would only
+    # come back empty ("No recent sounding data") -- or, for a two-word name,
+    # read its second word as a bad datetime. Point at /site instead,
+    # keeping any datetime that was given.
+    match, remaining = match_site(args)
+    if match is not None:
+        suggestion = ' '.join(['/site', match[0], *remaining])
+        await update.message.reply_text(f'Command failed: Did you mean {suggestion}?')
+        return
+
     station = args[0] if len(args) >= 1 else 'NKX'
     argv = ['--station', station]
     if len(args) >= 2:
-        argv += ['--datetime', args[1]]
+        argv += ['--datetime', chat_datetime(args[1])]
 
     await _render_and_reply(update, argv, timeout=120, label=station)
 
@@ -223,9 +266,11 @@ async def site(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     name, lat, lon = match
 
-    argv = ['--lat', str(lat), '--lon', str(lon), '--name', name]
-    if remaining:
-        argv += ['--datetime', ' '.join(remaining)]
+    # No time means this hour -- a forecast from the freshest run -- rather
+    # than the freshest run's own analysis, which for RRFS (3-hourly, posted
+    # ~1.5 h late) can be up to ~4 h old: 11am's at 2pm.
+    when = chat_datetime(' '.join(remaining)) if remaining else datetime.now(LOCAL_TZ).isoformat()
+    argv = ['--lat', str(lat), '--lon', str(lon), '--name', name, '--datetime', when]
 
     # A named site is a modeled (HRRR/RRFS/GFS) sounding, not the fast
     # Wyoming CSV archive /sounding uses -- a cold fetch (no cached GRIB2
@@ -251,8 +296,8 @@ async def post_init(application: Application) -> None:
     # commands there may need "@YourBotUsername" if another bot in the
     # same group also defines the same command name).
     await application.bot.set_my_commands([
-        BotCommand('sounding', 'Skew-T sounding: /sounding [station] [datetime]'),
-        BotCommand('site', 'Named-site sounding: /site <name> [datetime]'),
+        BotCommand('sounding', 'Observed radiosonde: /sounding [station] [local time]'),
+        BotCommand('site', 'Modeled sounding at a site, now: /site <name> [local time]'),
         BotCommand('sites', 'List named sites (from sites.tsv)'),
     ])
 
