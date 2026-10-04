@@ -156,10 +156,21 @@ cache is keyed by run, never by point, so it only grows with new runs.
 ## Telegram bot
 
 ```
-/sounding [station] [datetime]     e.g. /sounding NKX 2026-09-17T12
-/site <name> [datetime]            e.g. /site Little Black 2026-09-17T19
-/sites                             list the named sites
+/sounding [station] [time]     e.g. /sounding NKX 2026-09-17T17  (the 00Z launch)
+/site <name> [time]            e.g. /site Little Black            (this hour)
+                                    /site Little Black 14         (2pm today)
+                                    /site Little Black 2026-09-17T12
+/sites                         list the named sites
 ```
+
+Times typed into the bot are **local** — `SOUNDING_TIMEZONE`, default
+`America/Los_Angeles` — unless they name a zone (`2026-09-17T19Z`,
+`21Z`, `+00:00`). A bare hour means that hour today; `2pm` and `14:00`
+work too. The command line keeps reading bare times as UTC.
+
+`/site` with no time is a forecast for the current hour from the freshest
+model run. (It used to be that run's own analysis, which for RRFS —
+3-hourly, posted ~1.5 h late — can be up to ~4 h old.)
 
 Named sites come from `../sites.tsv`: one tab-separated `name`, `lat`,
 `lon` per line. The parser splits on `\s+` rather than on tabs
