@@ -172,6 +172,22 @@ Renders run in-process on a worker thread behind a lock, because pyplot
 is global mutable state — concurrent requests queue rather than
 interleaving.
 
+Repeat requests are answered from earlier renders while those are still
+current (`replay.py`, index in `replay-index/` beside the images):
+
+- **Observed** — a render of the launch asked for is kept for good.
+- **HRRR/RRFS** — kept until the bucket has a newer run covering the same
+  valid time (checked newest-first, ~0.6 s a run). A forecast refreshes
+  when a fresher run reaches its hour; a past hour is final once nothing
+  newer can still post (4 h after it).
+- **GFS**, or a render that fell back from the preferred model — kept for
+  an hour, since GFS doesn't say which cycle it came from.
+
+Forecast images carry their run in the name
+(`RRFS_…_20261004_11Z_run20261004_00Z.png`), so one run's forecast
+never overwrites another's. A new version of the code re-renders
+everything rather than replaying old-looking plots.
+
 ### Running it as a service
 
 ```bash

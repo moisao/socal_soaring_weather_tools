@@ -11,6 +11,7 @@ for a station, using MetPy, siphon, and Open-Meteo.
 """
 
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -89,10 +90,29 @@ def fetch_model_profile(lat, lon, date, model=None, forecast_hour=None, run_date
     raise RuntimeError('No model source available -- ' + '; '.join(errors))
 
 
+@dataclass
+class Rendered:
+    """What render() drew: the output path stub (plus .png/.svg) and
+    the data behind it, so a caller can tell later whether a newer model
+    run has superseded it (see replay.py)."""
+    stub: str
+    valid_time: datetime
+    model: str | None = None        # None for an observed sounding
+    run_time: datetime | None = None
+
+
 def main(args=None, output_dir=None):
     """Fetch the requested sounding(s), render both panels, and write the
     figure to disk as <stub>.png and <stub>.svg. Returns that stub (the
-    written paths are the stub plus those two extensions).
+    written paths are the stub plus those two extensions). See render()
+    for the details, and for what else it reports back."""
+    return render(args, output_dir).stub
+
+
+def render(args=None, output_dir=None):
+    """Fetch the requested sounding(s), render both panels, and write the
+    figure to disk as <stub>.png and <stub>.svg. Returns a Rendered with
+    that stub (the written paths are the stub plus those two extensions).
 
     Parses the command line when args is None, but accepts an
     already-built argparse Namespace so this can be driven in-process
@@ -129,6 +149,7 @@ def main(args=None, output_dir=None):
         df, date = fetch_recent_sounding(date, station)
         title_prefix = f'{station} Observed Sounding'
         model_run_date = None
+        model_used = None
 
     # The comparison sounding defaults to the previous synoptic run (12h
     # earlier) for the same station, but --compare/--compare-station let it
@@ -248,6 +269,11 @@ def main(args=None, output_dir=None):
                             parcel_p=parcel_p_path, parcel_profile=parcel_profile,
                             parcel_env_T=parcel_env_T)
     filename_stub = f'{station}_{date:%Y%m%d_%HZ}'
+    # A forecast also carries its run, so a later run's forecast for the
+    # same hour is a new file rather than overwriting this one. Analyses
+    # (and GFS, whose run isn't known) keep the plain name.
+    if model_run_date is not None and model_run_date != date:
+        filename_stub += f'_run{model_run_date:%Y%m%d_%HZ}'
     if output_dir is not None:
         filename_stub = str(Path(output_dir) / filename_stub)
 
@@ -288,7 +314,7 @@ def main(args=None, output_dir=None):
     # process (a batch loop, the bot), and pyplot keeps every unclosed
     # figure alive for the life of the interpreter.
     plt.close(fig)
-    return filename_stub
+    return Rendered(filename_stub, date, model_used, model_run_date)
 
 
 if __name__ == '__main__':

@@ -217,6 +217,68 @@ def _latest_available_run(model, max_tries=6):
     raise RuntimeError(f'No recent {model.upper()} run found')
 
 
+# Whether a (model, run, lead) has been posted, memoized for
+# newer_run_posted(): a posted file stays posted, so hits are kept for
+# good, while a miss is re-checked after RUN_MISS_TTL -- it may just not
+# have been posted yet.
+RUN_MISS_TTL = timedelta(minutes=5)
+_run_posted_memo = {}
+
+# Beyond this many hourly candidates, newer_run_posted() stops looking and
+# answers True: a render that old is cheaper to redo than to keep proving
+# current at ~0.6 s a lookup.
+MAX_NEWER_RUN_CANDIDATES = 12
+
+
+def _run_posted(model, run_date, forecast_hour):
+    key = (model, run_date, forecast_hour)
+    posted, checked_at = _run_posted_memo.get(key, (False, None))
+    now = datetime.now(timezone.utc)
+    if posted or (checked_at is not None and now - checked_at < RUN_MISS_TTL):
+        return posted
+    # priority='aws' keeps a miss to one lookup (~0.6 s) instead of walking
+    # every mirror Herbie knows about. A failed lookup counts as a miss:
+    # the caller then keeps what it has rather than failing outright.
+    try:
+        h = Herbie(run_date.replace(tzinfo=None), model=model, product='prs',
+                   fxx=forecast_hour, priority='aws', verbose=False)
+        posted = h.grib is not None
+    except Exception:
+        posted = False
+    if len(_run_posted_memo) > 10_000:
+        _run_posted_memo.clear()
+    _run_posted_memo[key] = (posted, now)
+    return posted
+
+
+def newer_run_posted(model, run_date, valid_time=None, now=None):
+    """Whether `model` has posted a run newer than run_date that a fresh
+    _fetch_grib_profile() call would use instead -- i.e. whether a render
+    made from run_date has been superseded.
+
+    valid_time is the valid time that was asked for; None means "the
+    latest run's analysis" (_fetch_grib_profile's date=None case), where
+    any newer run's own f00 supersedes it. Otherwise the candidates are the
+    runs after run_date up to the valid time itself (a past valid time is
+    always answered from the run at/before it) or up to now (a future one
+    from the freshest run that reaches it), each at the lead that lands on
+    valid_time -- the same (run, lead) pairs the fetch's step-back walks.
+
+    Checked newest-first against the bucket rather than a hardcoded
+    schedule: RRFS currently posts 3-hourly (f84 on 00/06/12/18Z, f18
+    otherwise) and HRRR hourly (f48/f18), and either may change."""
+    now = (now or datetime.now(timezone.utc)).replace(minute=0, second=0, microsecond=0)
+    candidate = now if valid_time is None else min(now, valid_time)
+    for _ in range(MAX_NEWER_RUN_CANDIDATES):
+        if candidate <= run_date:
+            return False
+        lead = 0 if valid_time is None else round((valid_time - candidate).total_seconds() / 3600)
+        if _run_posted(model, candidate, lead):
+            return True
+        candidate -= timedelta(hours=1)
+    return candidate > run_date
+
+
 # Product name for each model's surface/2D diagnostic fields (HGT:surface
 # -- terrain elevation -- among them). Different naming per model in
 # NOAA's own file layout: HRRR calls it "sfc", RRFS "2d".

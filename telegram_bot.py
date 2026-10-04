@@ -36,6 +36,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 import grib
 import Simple_Sounding
+from replay import ReplayIndex
+from wyoming import latest_synoptic_time
 
 logging.basicConfig(level=logging.INFO)
 # httpx logs every request at INFO, and the Telegram API puts the bot
@@ -51,6 +53,9 @@ SCRIPT_DIR = Path(__file__).parent
 SITES_FILE = Path(os.environ.get('SOUNDING_SITES_FILE') or SCRIPT_DIR.parent / 'sites.tsv')
 OUTPUT_DIR = Path(os.environ.get('SOUNDING_OUTPUT_DIR') or SCRIPT_DIR)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+# Earlier renders, re-sent while still current instead of fetched and
+# drawn again -- see replay.py.
+REPLAY = ReplayIndex(OUTPUT_DIR / 'replay-index')
 
 # matplotlib's pyplot is global, mutable state, so two renders must never
 # overlap -- concurrent requests queue here instead. Rendering in-process
@@ -143,15 +148,26 @@ def _render(argv: list) -> Path:
             # only the last part means anything to someone in a chat.
             message = complaint[-1].split('error: ', 1)[-1] if complaint else 'invalid arguments'
             raise BadArguments(message) from None
+        # "Latest" for an observed sounding means the latest synoptic
+        # launch, so pin that now: it's what this request is for, and it
+        # has to be part of the replay key or a 00Z render would be
+        # replayed for the 12Z launch.
+        if args.lat is None and args.datetime is None:
+            args.datetime = latest_synoptic_time()
+        replayed = REPLAY.lookup(args)
+        if replayed is not None:
+            logger.info('Replaying %s', replayed.name)
+            return replayed
         try:
-            stub = Simple_Sounding.main(args, output_dir=OUTPUT_DIR)
+            rendered = Simple_Sounding.render(args, output_dir=OUTPUT_DIR)
         finally:
             # The decoded-field memo pays off across sites in one batch;
             # here each request is usually a different run, so it would
             # just pin ~1 GB for the life of the service.
             grib.clear_field_cache()
             _release_freed_memory()
-    return Path(f'{stub}.png')
+        REPLAY.record(args, rendered)
+    return Path(f'{rendered.stub}.png')
 
 
 async def _render_and_reply(update: Update, argv: list, timeout: int, label: str) -> None:
