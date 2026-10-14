@@ -123,6 +123,11 @@ been split into modules.
   rather than 3-hourly, with its averaged heat flux un-averaged.
 - A run counts as posted only once both its files *and their `.idx`* are
   up: a run mid-upload has the GRIB2 before the index.
+- `/pf` as the short form of `/pointforecast`, and a model name after the
+  site (`/pf lb sat hrrr`) to use that model alone. Without one it's RRFS
+  then HRRR — GFS only when named, being too coarse to trust by default.
+- Site aliases: an optional fourth column in `sites.tsv` (`lb`, `torrey`,
+  …), matched like the name by every command.
 
 ## Also found along the way
 

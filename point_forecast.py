@@ -41,7 +41,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 import grib
-from config import CACHE_DIR, MODEL_PRIORITY
+from config import CACHE_DIR
 from skewt import MIXED_LAYER_DEPTH, make_msl_height_functions
 
 M_TO_FT = 3.280839895
@@ -121,6 +121,12 @@ TERRAIN_LABEL = 'HGT:surface'
 FLUX_LABEL = 'SHTFL:surface'
 
 FETCH_WORKERS = grib.HRRR_FETCH_WORKERS
+
+# Models tried, in order, when none is named. Not config.MODEL_PRIORITY:
+# GFS is deliberately left out. At 0.25 deg it is too coarse to trust for
+# a site's day, so it is used only when asked for by name; a day beyond
+# RRFS and HRRR says so rather than quietly coming back from GFS.
+DEFAULT_MODELS = ('rrfs', 'hrrr')
 
 
 class Unavailable(RuntimeError):
@@ -691,7 +697,7 @@ class PointForecast:
 def forecast(lat, lon, day, models=None, progress=None):
     """The point forecast for one local calendar day: an Hour for each
     hour the sun is up, from the first model in `models` (default
-    config.MODEL_PRIORITY) with data for all of them -- or, if none has,
+    DEFAULT_MODELS) with data for all of them -- or, if none has,
     whichever covers the most.
 
     One model for the whole day rather than hour-by-hour fallback: a
@@ -704,20 +710,25 @@ def forecast(lat, lon, day, models=None, progress=None):
     sunrise, sunset = sun_times(lat, lon, day)
 
     source = resolved = None
-    errors = []
-    for name in models or MODEL_PRIORITY:
+    tried, errors = [], []
+    for name in models or DEFAULT_MODELS:
+        tried.append(name.upper())
         try:
             candidate = _resolve(SOURCES[name], valid_times)
         except Exception as e:
-            errors.append(f'{name}: {e}')
+            errors.append(f'{name.upper()}: {e}')
             continue
         if resolved is None or len(candidate) > len(resolved):
             source, resolved = SOURCES[name], candidate
         if len(candidate) == len(valid_times):
             break
-        errors.append(f'{name}: reaches {len(candidate)} of {len(valid_times)} hours')
     if not resolved:
-        raise Unavailable(f'No model has {day:%a %b %-d} -- ' + '; '.join(errors))
+        when = f'{day:%a %b} {day.day}'
+        if errors:
+            raise Unavailable(f'No forecast for {when}: ' + '; '.join(errors))
+        if len(tried) == 1:
+            raise Unavailable(f"{tried[0]} doesn't reach {when} yet.")
+        raise Unavailable('Neither ' + ' nor '.join(tried) + f' reaches {when} yet.')
 
     session = _session()
     files = {valid: HourFile(source, run, lead) for valid, (run, lead) in resolved.items()}
@@ -822,8 +833,8 @@ def main(argv=None):
                         or 'America/Los_Angeles',
                         help='Zone the day and the hours are in (default: %(default)s)')
     parser.add_argument('--model', choices=sorted(SOURCES), default=None,
-                        help='Force one model instead of the priority chain ('
-                             + ' -> '.join(MODEL_PRIORITY) + ')')
+                        help='Use this model only, instead of '
+                             + ' then '.join(DEFAULT_MODELS) + ' (GFS only when named)')
     args = parser.parse_args(argv)
 
     from forecast_table import render_tables

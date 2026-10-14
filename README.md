@@ -157,16 +157,20 @@ and `…_wind.png`:
 `--date` takes a date, a bare day of the month (`17`), a weekday, `today`
 or `tomorrow`.
 
-It reads the same models, in the same priority order, as a modeled
-sounding, and each hour's run and lead are chosen by the same rule — so
+It reads the same models as a modeled sounding, and each hour's run and
+lead are chosen by the same rule — so
 a column agrees with the sounding for that hour. Checked on one RRFS
 hour against the sounding's own profile: same grid point, identical
 heights, temperatures and winds, dewpoint within 0.1 °C (it comes from RH
 here), top of lift within 15 ft. HRRR will differ a little more, since a
 sounding also merges in its native levels and this doesn't fetch them.
 
-One model serves the whole day: the first in the chain that reaches
-every hour, GFS being the only one past ~3.5 days. Past f120 GFS is
+One model serves the whole day: RRFS, or HRRR where RRFS doesn't reach
+every hour (`DEFAULT_MODELS`). GFS is left out of that chain on purpose
+— at 0.25° it's too coarse to trust for one site's day — so a day beyond
+both (RRFS goes out ~3.5 days, HRRR 2) is reported as out of range rather
+than quietly answered from GFS. `--model` (or a model named in the bot
+command) uses that one model alone, GFS included. Past f120 GFS is
 3-hourly, so a day that far out has a column every third hour.
 
 **Top of lift and cumulus base** are the sounding's own construction (the
@@ -229,9 +233,10 @@ cache is keyed by run, never by point, so it only grows with new runs.
 /site <name> [time]            e.g. /site Little Black            (this hour)
                                     /site Little Black 14         (2pm today)
                                     /site Little Black 2026-09-17T12
-/pointforecast <name> [day]    e.g. /pointforecast Little Black     (today)
-                                    /pointforecast Little Black 17  (the 17th)
-                                    /pointforecast Little Black sat
+/pf <name> [day] [model]       e.g. /pf lb                          (today)
+                                    /pf lb 17                       (the 17th)
+                                    /pf torrey sat hrrr             (HRRR only)
+                                    (/pointforecast is the long form)
 /sites                         list the named sites
 ```
 
@@ -244,8 +249,9 @@ work too. The command line keeps reading bare times as UTC.
 model run. (It used to be that run's own analysis, which for RRFS —
 3-hourly, posted ~1.5 h late — can be up to ~4 h old.)
 
-`/pointforecast` replies with the two [point forecast](#point-forecast)
-tables as an album. A bare number is a **day of the month** here, not an
+`/pf` replies with the two [point forecast](#point-forecast) tables as
+an album. A model name (`rrfs`, `hrrr`, `gfs`) anywhere after the site
+uses that model alone; without one it's RRFS, then HRRR. A bare number is a **day of the month** here, not an
 hour — the tables already cover every daylight hour — and no day means
 today, or tomorrow once the sun has set. A cold day is several hundred MB
 of GRIB2, so the "Fetching…" message counts up as it goes; a second site
@@ -254,7 +260,10 @@ replayed from `replay-index/` the way soundings are: a repeat re-reads the
 cached GRIB2, which takes seconds.
 
 Named sites come from `../sites.tsv`: one tab-separated `name`, `lat`,
-`lon` per line. The parser splits on `\s+` rather than on tabs
+`lon` per line, and optionally a fourth column of other names the site
+goes by, comma-separated (`Little Black → lb`, `Torrey Pines → torrey`).
+Aliases work everywhere a name does — `/site lb 14`, `/pf torrey sat` —
+and `/sites` lists them beside each name. The parser splits on `\s+` rather than on tabs
 specifically, so space-aligned lines still work — but a site name may
 contain single spaces ("Little Black"), so keep the columns tab-separated
 to avoid ambiguity. The longest matching prefix wins, so a trailing

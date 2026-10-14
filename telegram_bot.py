@@ -10,9 +10,10 @@ Usage (in a chat with the bot):
     /site Little Black 14           -> ... at 2pm today
     /site Little Black 2026-09-17T12 -> ... at that time
 
-    /pointforecast Little Black     -> today's daylight hours, as tables
-    /pointforecast Little Black 17  -> ... the 17th's
-    /pointforecast Little Black sat -> ... Saturday's
+    /pf lb                          -> today's daylight hours, as tables
+    /pf lb 17                       -> ... the 17th's
+    /pf lb sat hrrr                 -> ... Saturday's, from HRRR
+    (/pf is short for /pointforecast; "lb" is an alias from sites.tsv)
 
 Times are local (SOUNDING_TIMEZONE, default America/Los_Angeles) unless
 they say otherwise -- "2026-09-17T19Z" or "21Z" are UTC.
@@ -105,10 +106,11 @@ def _release_freed_memory():
 
 
 def load_sites():
-    """Parse sites.tsv: one 'Name   lat   lon' per line, name and the two
-    floats separated by runs of whitespace (the name itself may contain
-    single spaces, e.g. "Little Black") -- same format/parsing as the
-    batch scripts (interesting2.sh's site list, run_batch_sites.py)."""
+    """Parse sites.tsv: one 'Name   lat   lon   [aliases]' per line, name
+    and the two floats separated by runs of whitespace (the name itself
+    may contain single spaces, e.g. "Little Black"), then optionally the
+    other names the site goes by, comma-separated ("lb"). Returns
+    (name, lat, lon, aliases) tuples."""
     sites = []
     if not SITES_FILE.exists():
         return sites
@@ -117,9 +119,10 @@ def load_sites():
             line = line.rstrip('\n')
             if not line.strip():
                 continue
-            m = re.match(r'^(.*?)\s+(-?\d+\.\d+)\s+(-?\d+\.\d+)$', line)
+            m = re.match(r'^(.*?)\s+(-?\d+\.\d+)\s+(-?\d+\.\d+)(?:\s+(.+?))?\s*$', line)
             if m:
-                sites.append((m.group(1), float(m.group(2)), float(m.group(3))))
+                aliases = tuple(a.strip() for a in (m.group(4) or '').split(',') if a.strip())
+                sites.append((m.group(1), float(m.group(2)), float(m.group(3)), aliases))
     return sites
 
 
@@ -129,13 +132,14 @@ def match_site(args):
     '2026-09-17T19'] matches the two-word site "Little Black" and leaves
     ['2026-09-17T19'] over for the datetime -- tried longest-first so a
     multi-word site name isn't cut short by a plausible-looking prefix
-    match. Returns ((name, lat, lon), remaining_args), or (None, args) if
-    no prefix of args names a known site."""
+    match. A site's aliases match the same way as its name ("lb 14").
+    Returns ((name, lat, lon), remaining_args), or (None, args) if no
+    prefix of args names a known site."""
     sites = load_sites()
     for n in range(len(args), 0, -1):
         candidate = ' '.join(args[:n]).lower()
-        for name, lat, lon in sites:
-            if name.lower() == candidate:
+        for name, lat, lon, aliases in sites:
+            if candidate in (name.lower(), *(alias.lower() for alias in aliases)):
                 return (name, lat, lon), args[n:]
     return None, args
 
@@ -286,7 +290,7 @@ async def site(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _render_and_reply(update, argv, timeout=600, label=name)
 
 
-def _render_point_forecast(name, lat, lon, day, progress):
+def _render_point_forecast(name, lat, lon, day, models, progress):
     """Blocking: fetch one day's point forecast and draw its tables.
     Returns (forecast, [thermals PNG, wind PNG]).
 
@@ -295,7 +299,7 @@ def _render_point_forecast(name, lat, lon, day, progress):
     only halve each other's bandwidth."""
     with _render_lock:
         try:
-            result = point_forecast.forecast(lat, lon, day, progress=progress)
+            result = point_forecast.forecast(lat, lon, day, models=models, progress=progress)
         finally:
             _release_freed_memory()
         return result, forecast_table.render_tables(result, LOCAL_TZ, name=name,
@@ -306,7 +310,7 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     args = context.args
     if not args:
         await update.message.reply_text(
-            'Usage: /pointforecast <name> [day]\nSee /sites for the list of names.')
+            'Usage: /pf <site> [day] [rrfs|hrrr|gfs]\nSee /sites for the list of names.')
         return
 
     match, remaining = match_site(args)
@@ -315,6 +319,15 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f'Unknown site {" ".join(args)!r}. See /sites for the list of names.')
         return
     name, lat, lon = match
+
+    # A model named anywhere after the site forces that one model; without
+    # one it is point_forecast.DEFAULT_MODELS, RRFS and then HRRR.
+    named = [word.lower() for word in remaining if word.lower() in point_forecast.SOURCES]
+    if len(named) > 1:
+        await update.message.reply_text(f'Pick one model, not {" and ".join(named)}.')
+        return
+    models = named or None
+    remaining = [word for word in remaining if word.lower() not in point_forecast.SOURCES]
 
     now = datetime.now(LOCAL_TZ)
     if remaining:
@@ -353,12 +366,19 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     try:
         result, paths = await asyncio.wait_for(
-            asyncio.to_thread(_render_point_forecast, name, lat, lon, day, progress), 1800)
+            asyncio.to_thread(_render_point_forecast, name, lat, lon, day, models, progress),
+            1800)
     except asyncio.TimeoutError:
         await update.message.reply_text('Timed out fetching that forecast.')
         return
     except point_forecast.Unavailable as e:
-        await update.message.reply_text(str(e))
+        hint = ''
+        if models is None:
+            # GFS is never a silent fallback (see DEFAULT_MODELS), so say
+            # how to ask for it.
+            hint = (' RRFS goes out about 3.5 days and HRRR 2.'
+                    f'\nFor GFS anyway: /pf {" ".join(args)} gfs')
+        await update.message.reply_text(f'{e}{hint}')
         return
     except Exception as e:
         logger.exception('Point forecast failed')
@@ -382,7 +402,8 @@ async def list_sites(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not sites:
         await update.message.reply_text('No named sites configured (sites.tsv not found or empty).')
         return
-    lines = [name for name, lat, lon in sites]
+    lines = [f'{name} ({", ".join(aliases)})' if aliases else name
+             for name, lat, lon, aliases in sites]
     await update.message.reply_text('Named sites:\n' + '\n'.join(lines))
 
 
@@ -396,7 +417,7 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_commands([
         BotCommand('sounding', 'Observed radiosonde: /sounding [station] [local time]'),
         BotCommand('site', 'Modeled sounding at a site, now: /site <name> [local time]'),
-        BotCommand('pointforecast', 'Hourly lift, wind and cloud tables: /pointforecast <name> [day]'),
+        BotCommand('pf', 'Point forecast, hourly lift/wind/cloud: /pf <site> [day] [model]'),
         BotCommand('sites', 'List named sites (from sites.tsv)'),
     ])
 
@@ -409,7 +430,7 @@ def main() -> None:
     app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler('sounding', sounding))
     app.add_handler(CommandHandler('site', site))
-    app.add_handler(CommandHandler('pointforecast', pointforecast))
+    app.add_handler(CommandHandler(['pf', 'pointforecast'], pointforecast))
     app.add_handler(CommandHandler('sites', list_sites))
     logger.info('Bot starting (polling)...')
     app.run_polling()
