@@ -215,7 +215,6 @@ Everything lands in `cache/` (git-ignored):
 |---|---|
 | `<station>_<run>.csv` | Wyoming soundings |
 | `<MODEL>_<run>_f<lead>.grib2` | Fetched GRIB2 subset |
-| `<...>.fields.npz` | Decoded full fields, so a second point at the same run needs no network and no re-decode |
 | `<...>.native.grib2` | Native levels |
 | `<...>.surface.grib2` | 2 m / 10 m / surface-pressure fields |
 | `<MODEL>_terrain.npz` | Orography — static, so cached once per model rather than per run |

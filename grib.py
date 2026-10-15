@@ -72,6 +72,18 @@ MIN_ISOBARIC_MESSAGES = 110
 HRRR_FETCH_WORKERS = 16
 
 
+def _fetch_session():
+    """A requests session for the parallel byte-range pulls: retries on
+    the transient errors S3 hands out under load, and a connection pool
+    as big as the worker count so no worker waits on another's."""
+    session = requests.Session()
+    retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(pool_connections=HRRR_FETCH_WORKERS,
+                          pool_maxsize=HRRR_FETCH_WORKERS, max_retries=retry)
+    session.mount('https://', adapter)
+    return session
+
+
 def _lcc_cone_constant(latin1, latin2):
     """Lambert Conformal Conic cone constant from the grid's standard
     parallels -- HRRR uses a single tangent parallel (Latin1==Latin2), so
@@ -94,14 +106,17 @@ def _decode_grib_fields(grib_path, lat, lon):
     across a single RRFS run's ~125 messages on its ~1.9M-point North
     America grid, and that cost repeats on every call even though the
     field data is identical between calls for the same run (only the
-    query point differs). Decoding straight to full numpy arrays once
-    and caching them (compressed, alongside the raw GRIB2 subset)
-    instead means a second point looked up against an already-decoded
-    run costs a KDTree build (under a second, from the cached lat/lon
-    grid) and a query (sub-millisecond) rather than that same ~60s of
-    eccodes decode all over again -- and it's a bit faster even on the
-    very first point, since a plain values decode is itself faster than
-    find_nearest's own per-message overhead.
+    query point differs). A plain values decode to full numpy arrays
+    instead takes ~3s for a whole RRFS run (225 messages, measured on
+    an M1), after which any point is a KD-tree query (sub-millisecond)
+    -- and _load_fields memoizes those arrays for a batch of points.
+
+    Nothing decoded is written to disk. That used to be cached as a
+    compressed .fields.npz beside the GRIB2 subset, but it came out
+    twice the subset's size (657 vs 312 MB for one RRFS run), its zlib
+    pass took ~56s of single-threaded CPU on every cold fetch, and
+    loading it back was no faster than decoding the GRIB2 again
+    (2.95 vs 2.98s).
 
     The grid's lat/lon and the LCC cone constant/central meridian only
     need decoding once (identical for every message sharing a grid
@@ -134,8 +149,8 @@ def _load_fields(grib_path):
     KD-tree over that grid -- everything about a run that doesn't depend
     on which point is being looked up.
 
-    Memoized because none of it does depend on the point: decompressing
-    the arrays and building the tree measured ~3.6s for one RRFS run, and
+    Memoized because none of it does depend on the point: decoding the
+    arrays and building the tree measured ~3.6s for one RRFS run, and
     a batch of sites against that same run was paying it once per site
     for an answer that never changed. The per-point work left downstream
     is a single tree query, ~0.2 ms.
@@ -146,50 +161,32 @@ def _load_fields(grib_path):
     published, native), and a cache of 1 would evict between them and
     memoize nothing. A long-lived process that isn't batching should call
     clear_field_cache() when it's done rather than hold that."""
-    fields_path = grib_path.with_suffix('.fields.npz')
-    if fields_path.exists():
-        cached = np.load(fields_path)
-        lats, lons = cached['latitudes'], cached['longitudes']
-        cone, lov = float(cached['cone']), float(cached['lov'])
-        values = {k: cached[k] for k in cached.files if k not in ('latitudes', 'longitudes', 'cone', 'lov')}
-    else:
-        lats = lons = None
-        cone = lov = None
-        values = {}
-        with open(grib_path, 'rb') as f:
-            while True:
-                gid = eccodes.codes_grib_new_from_file(f)
-                if gid is None:
-                    break
-                short_name = eccodes.codes_get(gid, 'shortName')
-                level = eccodes.codes_get(gid, 'level')
-                if lats is None:
-                    lats = np.asarray(eccodes.codes_get_array(gid, 'latitudes'), dtype=np.float32)
-                    lons = np.asarray(eccodes.codes_get_array(gid, 'longitudes'), dtype=np.float32)
-                values[f'{short_name}_{level}'] = np.asarray(
-                    eccodes.codes_get_array(gid, 'values'), dtype=np.float32)
-                # eccodes names the wind components by level type: plain
-                # u/v on isobaric and hybrid levels, but 10u/10v for the
-                # fixed 10 m diagnostic winds (URMA and the models' own
-                # surface products). Both are the same grid-relative
-                # components, and either one carries the projection
-                # metadata this needs.
-                if short_name in ('u', 'v', '10u', '10v') and cone is None:
-                    cone = _lcc_cone_constant(eccodes.codes_get(gid, 'Latin1InDegrees'),
-                                              eccodes.codes_get(gid, 'Latin2InDegrees'))
-                    lov = eccodes.codes_get(gid, 'LoVInDegrees')
-                eccodes.codes_release(gid)
-
-        # .part + rename so a run interrupted mid-write can't leave a
-        # truncated cache file that a later call mistakes for complete.
-        # np.savez_compressed auto-appends ".npz" to a string/Path target
-        # (which would turn ...npz.part into ...npz.part.npz and break
-        # the rename below) but not to an already-open file object.
-        tmp_path = fields_path.with_suffix('.npz.part')
-        with open(tmp_path, 'wb') as tmp:
-            np.savez_compressed(tmp, latitudes=lats, longitudes=lons,
-                                cone=np.float32(cone), lov=np.float32(lov), **values)
-        tmp_path.rename(fields_path)
+    lats = lons = None
+    cone = lov = None
+    values = {}
+    with open(grib_path, 'rb') as f:
+        while True:
+            gid = eccodes.codes_grib_new_from_file(f)
+            if gid is None:
+                break
+            short_name = eccodes.codes_get(gid, 'shortName')
+            level = eccodes.codes_get(gid, 'level')
+            if lats is None:
+                lats = np.asarray(eccodes.codes_get_array(gid, 'latitudes'), dtype=np.float32)
+                lons = np.asarray(eccodes.codes_get_array(gid, 'longitudes'), dtype=np.float32)
+            values[f'{short_name}_{level}'] = np.asarray(
+                eccodes.codes_get_array(gid, 'values'), dtype=np.float32)
+            # eccodes names the wind components by level type: plain
+            # u/v on isobaric and hybrid levels, but 10u/10v for the
+            # fixed 10 m diagnostic winds (URMA and the models' own
+            # surface products). Both are the same grid-relative
+            # components, and either one carries the projection
+            # metadata this needs.
+            if short_name in ('u', 'v', '10u', '10v') and cone is None:
+                cone = _lcc_cone_constant(eccodes.codes_get(gid, 'Latin1InDegrees'),
+                                          eccodes.codes_get(gid, 'Latin2InDegrees'))
+                lov = eccodes.codes_get(gid, 'LoVInDegrees')
+            eccodes.codes_release(gid)
 
     tree = cKDTree(np.column_stack([lats, lons]))
     return lats, lons, cone, lov, values, tree
@@ -205,15 +202,26 @@ def clear_field_cache():
 
 
 def _latest_available_run(model, max_tries=6):
-    """The most recently posted run for an hourly model, found by
-    starting from the current hour and stepping back until Herbie finds
-    one -- posting typically lags real time by an hour or two."""
-    run_date = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    for _ in range(max_tries):
+    """The most recently posted run for an hourly model: the newest of
+    the current hour and the max_tries - 1 before it that Herbie finds
+    -- posting typically lags real time by an hour or two.
+
+    The candidate hours are probed all at once rather than stepping back
+    one at a time: a miss costs ~1.1s (Herbie walks its mirrors before
+    giving up), and RRFS's 3-hourly off-cycle runs plus its posting lag
+    routinely meant three misses before a hit -- ~4s measured, now about
+    one probe's worth."""
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    candidates = [now - timedelta(hours=i) for i in range(max_tries)]
+
+    def _posted(run_date):
         h = Herbie(run_date.replace(tzinfo=None), model=model, product='prs', fxx=0, verbose=False)
-        if h.grib is not None:
-            return run_date
-        run_date -= timedelta(hours=1)
+        return h.grib is not None
+
+    with ThreadPoolExecutor(max_workers=max_tries) as ex:
+        for run_date, posted in zip(candidates, ex.map(_posted, candidates)):
+            if posted:
+                return run_date
     raise RuntimeError(f'No recent {model.upper()} run found')
 
 
@@ -353,29 +361,12 @@ def _fetch_terrain_height(model, lat, lon, max_tries=6):
     return float(values[idx])
 
 
-def _fetch_surface_row(model, cache_prefix, run_date, forecast_hour, lat, lon,
-                       terrain_height, session):
-    """The model's own surface diagnostics as one profile row (2 m
-    temperature/dewpoint, 10 m wind, surface pressure), or None if this
-    model/run doesn't publish them.
-
-    Without this the lowest row of a modeled profile is whichever
-    *isobaric* level survives the terrain trim, and a surface parcel gets
-    launched from there. That is fine where native levels reach nearly to
-    the ground (HRRR's level 1 measured ~11 m AGL) but badly wrong
-    otherwise: RRFS publishes no native levels, so its lowest retained
-    level measured 150-230 m AGL across these sites, and its 2 m
-    temperature ran 3.6-4.6 degC warmer than the air up there. Launching
-    a "surface" parcel from 200 m up discards exactly the superadiabatic
-    layer that drives a thermal, and it starts the parcel neutral with
-    its environment by construction -- both of which make the model look
-    like it under-forecasts surface heating when it doesn't.
-
-    So this is fetched for every model rather than only the ones missing
-    native levels: it is what "surface" should have meant all along, and
-    it removes the model-to-model asymmetry in what the parcel starts
-    from. Same product the terrain height comes from, but keyed per
-    run/lead rather than cached once, since these fields do vary."""
+def _fetch_surface_subset(model, cache_prefix, run_date, forecast_hour, session):
+    """Download (or find already cached) the surface diagnostics that
+    _fetch_surface_row reads, returning the cached path -- or None if
+    this model/run doesn't publish them. Network only, no decode, so it
+    can run in the background alongside the isobaric download (see
+    _fetch_grib_profile)."""
     product = SURFACE_PRODUCT.get(model)
     if product is None:
         return None
@@ -408,6 +399,35 @@ def _fetch_surface_row(model, cache_prefix, run_date, forecast_hour, lat, lon,
                 for content in ex.map(_fetch_one, (row for _, row in inventory.iterrows())):
                     tmp.write(content)
         tmp_path.rename(cache_path)
+    return cache_path
+
+
+def _fetch_surface_row(model, cache_prefix, run_date, forecast_hour, lat, lon,
+                       terrain_height, session):
+    """The model's own surface diagnostics as one profile row (2 m
+    temperature/dewpoint, 10 m wind, surface pressure), or None if this
+    model/run doesn't publish them.
+
+    Without this the lowest row of a modeled profile is whichever
+    *isobaric* level survives the terrain trim, and a surface parcel gets
+    launched from there. That is fine where native levels reach nearly to
+    the ground (HRRR's level 1 measured ~11 m AGL) but badly wrong
+    otherwise: RRFS publishes no native levels, so its lowest retained
+    level measured 150-230 m AGL across these sites, and its 2 m
+    temperature ran 3.6-4.6 degC warmer than the air up there. Launching
+    a "surface" parcel from 200 m up discards exactly the superadiabatic
+    layer that drives a thermal, and it starts the parcel neutral with
+    its environment by construction -- both of which make the model look
+    like it under-forecasts surface heating when it doesn't.
+
+    So this is fetched for every model rather than only the ones missing
+    native levels: it is what "surface" should have meant all along, and
+    it removes the model-to-model asymmetry in what the parcel starts
+    from. Same product the terrain height comes from, but keyed per
+    run/lead rather than cached once, since these fields do vary."""
+    cache_path = _fetch_surface_subset(model, cache_prefix, run_date, forecast_hour, session)
+    if cache_path is None:
+        return None
 
     levels, cone, lov = _decode_grib_fields(cache_path, lat, lon)
     # eccodes names the height-tagged diagnostics by their level rather
@@ -438,6 +458,62 @@ def _fetch_surface_row(model, cache_prefix, run_date, forecast_hour, lat, lon,
     }
 
 
+def _fetch_native_subset(model, cache_prefix, run_date, forecast_hour, session):
+    """Download (or find already cached) the native levels that
+    _fetch_native_levels reads, returning the cached path -- or None if
+    this model/run doesn't publish them. Network only, no decode, so it
+    can run in the background alongside the isobaric download (see
+    _fetch_grib_profile)."""
+    product = NATIVE_LEVEL_PRODUCT.get(model)
+    if product is None:
+        return None
+
+    # A model that doesn't publish these (RRFS today) otherwise costs a
+    # network probe on every single call -- ~2.2s each, and for a batch of
+    # sites on one run that is the same negative answer over and over.
+    # Remembered per (model, run, lead) rather than per model, so it stays
+    # correct the day RRFS does start publishing: a later run is probed
+    # again rather than being written off.
+    unavailable_key = (model, run_date, forecast_hour)
+    if unavailable_key in _NATIVE_UNAVAILABLE:
+        return None
+
+    # Cache is keyed the same way the isobaric fetch's is (model/run/lead,
+    # not lat/lon) -- checked first so a run already on disk skips the
+    # Herbie network probe entirely, same as the isobaric path below.
+    cache_path = CACHE_DIR / f'{cache_prefix}_{run_date:%Y%m%d_%HZ}_f{forecast_hour:02d}.native.grib2'
+    if not cache_path.exists():
+        h = Herbie(run_date.replace(tzinfo=None), model=model, product=product,
+                  fxx=forecast_hour, verbose=False)
+        if h.grib is None:
+            _NATIVE_UNAVAILABLE.add(unavailable_key)
+            return None
+
+        wanted_levels = '|'.join(str(lvl) for lvl in range(1, MAX_NATIVE_LEVEL + 1))
+        search = rf':(?:PRES|HGT|TMP|SPFH|UGRD|VGRD):(?:{wanted_levels}) hybrid level:'
+        inventory = h.inventory(search=search)
+        if len(inventory) < MAX_NATIVE_LEVEL * 6 * 0.9:
+            # missing more than expected -- treat as unavailable rather than guess
+            _NATIVE_UNAVAILABLE.add(unavailable_key)
+            return None
+
+        def _fetch_one(row):
+            start = int(row.start_byte)
+            end = None if pd.isna(row.end_byte) else int(row.end_byte)
+            range_hdr = f'bytes={start}-{end}' if end is not None else f'bytes={start}-'
+            r = session.get(h.grib, headers={'Range': range_hdr}, timeout=30)
+            r.raise_for_status()
+            return r.content
+
+        tmp_path = cache_path.with_suffix('.grib2.part')
+        with ThreadPoolExecutor(max_workers=HRRR_FETCH_WORKERS) as ex:
+            with open(tmp_path, 'wb') as tmp:
+                for content in ex.map(_fetch_one, (row for _, row in inventory.iterrows())):
+                    tmp.write(content)
+        tmp_path.rename(cache_path)
+    return cache_path
+
+
 def _fetch_native_levels(model, cache_prefix, run_date, forecast_hour, lat, lon, session):
     """Extra near-surface rows (same shape as _fetch_grib_profile's own
     row dicts) from the model's native/hybrid levels 1..MAX_NATIVE_LEVEL,
@@ -456,53 +532,9 @@ def _fetch_native_levels(model, cache_prefix, run_date, forecast_hour, lat, lon,
     its own) -- these levels only make sense paired with the exact same
     run already resolved for the isobaric fetch, not independently
     re-resolved."""
-    product = NATIVE_LEVEL_PRODUCT.get(model)
-    if product is None:
+    cache_path = _fetch_native_subset(model, cache_prefix, run_date, forecast_hour, session)
+    if cache_path is None:
         return []
-
-    # A model that doesn't publish these (RRFS today) otherwise costs a
-    # network probe on every single call -- ~2.2s each, and for a batch of
-    # sites on one run that is the same negative answer over and over.
-    # Remembered per (model, run, lead) rather than per model, so it stays
-    # correct the day RRFS does start publishing: a later run is probed
-    # again rather than being written off.
-    unavailable_key = (model, run_date, forecast_hour)
-    if unavailable_key in _NATIVE_UNAVAILABLE:
-        return []
-
-    # Cache is keyed the same way the isobaric fetch's is (model/run/lead,
-    # not lat/lon) -- checked first so a run already on disk skips the
-    # Herbie network probe entirely, same as the isobaric path below.
-    cache_path = CACHE_DIR / f'{cache_prefix}_{run_date:%Y%m%d_%HZ}_f{forecast_hour:02d}.native.grib2'
-    if not cache_path.exists():
-        h = Herbie(run_date.replace(tzinfo=None), model=model, product=product,
-                  fxx=forecast_hour, verbose=False)
-        if h.grib is None:
-            _NATIVE_UNAVAILABLE.add(unavailable_key)
-            return []
-
-        wanted_levels = '|'.join(str(lvl) for lvl in range(1, MAX_NATIVE_LEVEL + 1))
-        search = rf':(?:PRES|HGT|TMP|SPFH|UGRD|VGRD):(?:{wanted_levels}) hybrid level:'
-        inventory = h.inventory(search=search)
-        if len(inventory) < MAX_NATIVE_LEVEL * 6 * 0.9:
-            # missing more than expected -- treat as unavailable rather than guess
-            _NATIVE_UNAVAILABLE.add(unavailable_key)
-            return []
-
-        def _fetch_one(row):
-            start = int(row.start_byte)
-            end = None if pd.isna(row.end_byte) else int(row.end_byte)
-            range_hdr = f'bytes={start}-{end}' if end is not None else f'bytes={start}-'
-            r = session.get(h.grib, headers={'Range': range_hdr}, timeout=30)
-            r.raise_for_status()
-            return r.content
-
-        tmp_path = cache_path.with_suffix('.grib2.part')
-        with ThreadPoolExecutor(max_workers=HRRR_FETCH_WORKERS) as ex:
-            with open(tmp_path, 'wb') as tmp:
-                for content in ex.map(_fetch_one, (row for _, row in inventory.iterrows())):
-                    tmp.write(content)
-        tmp_path.rename(cache_path)
 
     levels, cone, lov = _decode_grib_fields(cache_path, lat, lon)
 
@@ -650,67 +682,81 @@ def _fetch_grib_profile(lat, lon, date, model, cache_prefix, forecast_hour=None,
             # gets the hour that was actually asked for.
             hold_valid_time = valid_time
 
-    session = requests.Session()
-    retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
-    adapter = HTTPAdapter(pool_connections=HRRR_FETCH_WORKERS,
-                          pool_maxsize=HRRR_FETCH_WORKERS, max_retries=retry)
-    session.mount('https://', adapter)
+    session = _fetch_session()
 
     search = ISOBARIC_SEARCH
 
     grib_path = None
-    for _ in range(max_tries if (allow_retry or hold_valid_time is not None) else 1):
-        candidate_path = CACHE_DIR / f'{cache_prefix}_{run_date:%Y%m%d_%HZ}_f{forecast_hour:02d}.grib2'
-        if candidate_path.exists():
+    # The native and surface subsets need only the run and lead, so once
+    # the loop below has settled those they download in the background,
+    # alongside the isobaric subset rather than one after the other after
+    # it. Their own session, so the three downloads' worker threads don't
+    # overflow one connection pool between them.
+    prefetch = ThreadPoolExecutor(max_workers=2)
+    prefetch_session = _fetch_session()
+    try:
+        for _ in range(max_tries if (allow_retry or hold_valid_time is not None) else 1):
+            candidate_path = CACHE_DIR / f'{cache_prefix}_{run_date:%Y%m%d_%HZ}_f{forecast_hour:02d}.grib2'
+            if candidate_path.exists():
+                grib_path = candidate_path
+                break
+
+            h = Herbie(run_date.replace(tzinfo=None), model=model, product='prs',
+                      fxx=forecast_hour, verbose=False)
+            if h.grib is None:
+                if hold_valid_time is not None:
+                    # Step back to an older run and lengthen the lead by the
+                    # same hour, so the valid time being asked for doesn't move.
+                    run_date -= timedelta(hours=1)
+                    forecast_hour = round((hold_valid_time - run_date).total_seconds() / 3600)
+                    continue
+                if not allow_retry:
+                    raise RuntimeError(f'{model.upper()} run {run_date:%Y-%m-%d %HZ} has no '
+                                       f'f{forecast_hour:02d} forecast')
+                run_date -= timedelta(hours=1)
+                continue
+            url = h.grib
+
+            for fetch_subset in (_fetch_native_subset, _fetch_surface_subset):
+                prefetch.submit(fetch_subset, model, cache_prefix, run_date, forecast_hour,
+                                prefetch_session)
+
+            inventory = h.inventory(search=search)
+            if len(inventory) < MIN_ISOBARIC_MESSAGES:
+                raise RuntimeError(f'{model.upper()} index missing expected messages for {run_date} '
+                                   f'({len(inventory)} < {MIN_ISOBARIC_MESSAGES})')
+
+            def _fetch_one(row):
+                start = int(row.start_byte)
+                end = None if pd.isna(row.end_byte) else int(row.end_byte)
+                range_hdr = f'bytes={start}-{end}' if end is not None else f'bytes={start}-'
+                r = session.get(url, headers={'Range': range_hdr}, timeout=30)
+                r.raise_for_status()
+                return r.content
+
+            # Written to a .part path and renamed only once complete, so a
+            # run interrupted mid-fetch can't leave a truncated file that a
+            # later call mistakes for a valid, complete cache entry.
+            tmp_path = candidate_path.with_suffix('.grib2.part')
+            with ThreadPoolExecutor(max_workers=HRRR_FETCH_WORKERS) as ex:
+                with open(tmp_path, 'wb') as tmp:
+                    for content in ex.map(_fetch_one, (row for _, row in inventory.iterrows())):
+                        tmp.write(content)
+            tmp_path.rename(candidate_path)
             grib_path = candidate_path
             break
-
-        h = Herbie(run_date.replace(tzinfo=None), model=model, product='prs',
-                  fxx=forecast_hour, verbose=False)
-        if h.grib is None:
+        else:
             if hold_valid_time is not None:
-                # Step back to an older run and lengthen the lead by the
-                # same hour, so the valid time being asked for doesn't move.
-                run_date -= timedelta(hours=1)
-                forecast_hour = round((hold_valid_time - run_date).total_seconds() / 3600)
-                continue
-            if not allow_retry:
-                raise RuntimeError(f'{model.upper()} run {run_date:%Y-%m-%d %HZ} has no '
-                                   f'f{forecast_hour:02d} forecast')
-            run_date -= timedelta(hours=1)
-            continue
-        url = h.grib
-
-        inventory = h.inventory(search=search)
-        if len(inventory) < MIN_ISOBARIC_MESSAGES:
-            raise RuntimeError(f'{model.upper()} index missing expected messages for {run_date} '
-                               f'({len(inventory)} < {MIN_ISOBARIC_MESSAGES})')
-
-        def _fetch_one(row):
-            start = int(row.start_byte)
-            end = None if pd.isna(row.end_byte) else int(row.end_byte)
-            range_hdr = f'bytes={start}-{end}' if end is not None else f'bytes={start}-'
-            r = session.get(url, headers={'Range': range_hdr}, timeout=30)
-            r.raise_for_status()
-            return r.content
-
-        # Written to a .part path and renamed only once complete, so a
-        # run interrupted mid-fetch can't leave a truncated file that a
-        # later call mistakes for a valid, complete cache entry.
-        tmp_path = candidate_path.with_suffix('.grib2.part')
-        with ThreadPoolExecutor(max_workers=HRRR_FETCH_WORKERS) as ex:
-            with open(tmp_path, 'wb') as tmp:
-                for content in ex.map(_fetch_one, (row for _, row in inventory.iterrows())):
-                    tmp.write(content)
-        tmp_path.rename(candidate_path)
-        grib_path = candidate_path
-        break
-    else:
-        if hold_valid_time is not None:
-            raise RuntimeError(
-                f'No {model.upper()} run reaches {hold_valid_time:%Y-%m-%d %HZ} -- tried back to '
-                f'{run_date:%Y-%m-%d %HZ} at f{forecast_hour:02d}')
-        raise RuntimeError(f'No {model.upper()} run found near {date}')
+                raise RuntimeError(
+                    f'No {model.upper()} run reaches {hold_valid_time:%Y-%m-%d %HZ} -- tried back to '
+                    f'{run_date:%Y-%m-%d %HZ} at f{forecast_hour:02d}')
+            raise RuntimeError(f'No {model.upper()} run found near {date}')
+    finally:
+        # Waited for even when the isobaric fetch failed, rather than
+        # returning with downloads still running. A prefetch's own failure
+        # isn't raised here: _fetch_native_levels/_fetch_surface_row below
+        # find no cached file and simply fetch it again themselves.
+        prefetch.shutdown(wait=True)
 
     levels, cone, lov = _decode_grib_fields(grib_path, lat, lon)
 

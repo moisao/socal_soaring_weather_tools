@@ -129,6 +129,24 @@ been split into modules.
 - Site aliases: an optional fourth column in `sites.tsv` (`lb`, `torrey`,
   …), matched like the name by every command.
 
+## Faster cold renders
+
+A cold `/site` render measured 157 s on an M1 (84 s in the cluster).
+Profiled, about a third of that was not fetching at all:
+
+- **No more `.fields.npz`.** Every cold fetch zlib-compressed the
+  decoded full fields to disk: ~56 s of single-threaded CPU, for a file
+  twice the size of the GRIB2 it came from (657 vs 312 MB) that loaded
+  back no faster than decoding the GRIB2 again (2.95 vs 2.98 s). Fields
+  are now decoded from the GRIB2 directly, still memoized in memory.
+- The native and surface subsets download in the background alongside
+  the isobaric one, rather than one after another after it.
+- The latest-run lookup probes its candidate hours at once instead of
+  stepping back an hour at a time (~1.1 s a miss, often three misses).
+
+Same profile, row for row; 157 → 80 s cold on the M1, where nearly
+all of what's left is downloading 312 MB.
+
 ## Also found along the way
 
 - 1000 mb is the highest isobaric level either model publishes; there is
