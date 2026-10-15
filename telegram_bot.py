@@ -27,6 +27,10 @@ shelled out to), so it has to be importable, and its cache/ lives here.
 
 No chat ID is needed -- this replies wherever the command came from,
 it doesn't push anywhere on its own.
+
+SOUNDING_PREWARM="6-20" fetches each new model run for this hour and
+the next ahead of any /site, between those local hours (inclusive);
+unset, nothing is fetched until asked for. See _prewarm_loop.
 """
 
 import asyncio
@@ -124,6 +128,17 @@ def load_sites():
                 aliases = tuple(a.strip() for a in (m.group(4) or '').split(',') if a.strip())
                 sites.append((m.group(1), float(m.group(2)), float(m.group(3)), aliases))
     return sites
+
+
+def sites_region(sites, margin=0.25):
+    """(lat_min, lat_max, lon_min, lon_max) around every named site, with
+    `margin` degrees to spare -- the area grib.set_region keeps on hand.
+    None without any sites."""
+    if not sites:
+        return None
+    lats = [lat for _, lat, _, _ in sites]
+    lons = [lon for _, _, lon, _ in sites]
+    return (min(lats) - margin, max(lats) + margin, min(lons) - margin, max(lons) + margin)
 
 
 def match_site(args):
@@ -407,6 +422,58 @@ async def list_sites(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text('Named sites:\n' + '\n'.join(lines))
 
 
+# How often the pre-warm checks for a newer run. A run posts about hourly;
+# a check that finds nothing new is a handful of ~1 s lookups.
+PREWARM_INTERVAL = timedelta(minutes=5)
+
+
+def prewarm_hours(spec):
+    """The local hours a SOUNDING_PREWARM value like '6-20' covers
+    (inclusive), or an empty range when it's unset."""
+    if not spec:
+        return range(0)
+    start, end = (int(part) for part in spec.split('-'))
+    return range(start, end + 1)
+
+
+def _prewarm_loop(hours):
+    """Keep the freshest run's soundings for this hour and the next on
+    disk before anyone asks, so a /site doesn't wait out the download --
+    which, at ~300 MB a run for RRFS, is most of a cold render.
+
+    Asks for exactly what /site would (fetch_model_profile at a valid
+    time, the same model chain), so whatever run and lead a request
+    resolves to is the one already cached. One site's point is enough:
+    the subsets are the whole grid, and the region crop the decode
+    leaves behind (grib.set_region) covers every site.
+
+    Not under _render_lock: a download here would otherwise hold up
+    every request for its whole length. grib's own per-file locks keep a
+    request for the same file from fetching it a second time -- it waits
+    for this one to finish instead."""
+    while True:
+        now = datetime.now(LOCAL_TZ)
+        sites = load_sites()
+        if sites and now.hour in hours:
+            grib.set_region(sites_region(sites))
+            _, lat, lon, _ = sites[0]
+            for ahead in (0, 1):
+                valid = now + timedelta(hours=ahead)
+                try:
+                    started = time.monotonic()
+                    _, valid_time, run_time, model = Simple_Sounding.fetch_model_profile(lat, lon, valid)
+                    logger.info('Pre-warmed %s %s f%02d in %.1fs', model.upper(),
+                                f'{run_time:%Y-%m-%d %HZ}',
+                                round((valid_time - run_time).total_seconds() / 3600),
+                                time.monotonic() - started)
+                except Exception:
+                    logger.exception('Pre-warm for %s failed', f'{valid:%H:00}')
+                finally:
+                    grib.clear_field_cache()
+                    _release_freed_memory()
+        time.sleep(PREWARM_INTERVAL.total_seconds())
+
+
 async def post_init(application: Application) -> None:
     # Registers the "/" autocomplete menu Telegram clients show while
     # typing -- without this the command still works, but no hint pops
@@ -426,6 +493,14 @@ def main() -> None:
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     if not token:
         raise SystemExit('Set TELEGRAM_BOT_TOKEN in the environment first.')
+
+    # Set here as well as by the pre-warm, so a cold request's decode
+    # leaves a region crop behind for the next site even with it off.
+    grib.set_region(sites_region(load_sites()))
+    hours = prewarm_hours(os.environ.get('SOUNDING_PREWARM'))
+    if hours:
+        threading.Thread(target=_prewarm_loop, args=(hours,), name='prewarm', daemon=True).start()
+        logger.info('Pre-warming model runs between %02d:00 and %02d:59', hours[0], hours[-1])
 
     app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler('sounding', sounding))

@@ -110,11 +110,12 @@ is analysis-only, so it can never cover a future valid time.
 
 In order, and the order matters:
 
-1. **Isobaric levels**, 1000→400 mb in 25 mb steps. 1000 mb is the
-   highest level either model publishes — there is no 1025/1050 mb.
+1. **Isobaric levels**, 1000→100 mb (25 mb steps up to 400, coarser
+   above). 1000 mb is the highest level either model publishes — there
+   is no 1025/1050 mb. Above 100 mb is stratosphere, and not fetched.
 2. **Native/hybrid levels** merged in where the model publishes them.
-   HRRR does (`nat`, level 1 is ~11 m AGL); RRFS does not yet, so this
-   is currently a no-op there.
+   HRRR does (`nat`, level 1 is ~11 m AGL; levels 1–38, up to ~112 mb);
+   RRFS does not yet, so this is currently a no-op there.
 3. **Terrain trim** — anything below the model's own orography is
    dropped. Isobaric fields are extrapolated below ground rather than
    left missing, so without this the plot starts in imaginary
@@ -217,6 +218,7 @@ Everything lands in `cache/` (git-ignored):
 | `<MODEL>_<run>_f<lead>.grib2` | Fetched GRIB2 subset |
 | `<...>.native.grib2` | Native levels |
 | `<...>.surface.grib2` | 2 m / 10 m / surface-pressure fields |
+| `<...>.region.npz` | The bot's sites' area, cropped out of any of those three once decoded — a few MB instead of ~1 GB to decode for the next site (`grib.set_region`) |
 | `<MODEL>_terrain.npz` | Orography — static, so cached once per model rather than per run |
 | `<MODEL>_<run>_f<lead>.point.grib2` | Point-forecast messages for that hour; appended to as other sites ask for other levels |
 | `<...>.point.json` | What that file holds, in order |
@@ -271,6 +273,19 @@ datetime doesn't confuse a two-word name.
 Renders run in-process on a worker thread behind a lock, because pyplot
 is global mutable state — concurrent requests queue rather than
 interleaving.
+
+`SOUNDING_PREWARM="6-20"` keeps the freshest model run's soundings for
+this hour and the next downloaded ahead of time, checking every 5
+minutes between those local hours. A cold `/site` is mostly download
+(~280 MB of RRFS a lead); pre-warmed, it renders in about 4 s. That costs
+roughly 0.5–0.8 GB of downloads an hour while it's on. Unset, nothing is
+fetched until someone asks.
+
+No server offers these models cut to an area — NOMADS' grib filter has
+no RRFS and only 7 HRRR pressure levels — so every fetch is the whole
+grid. What does get cut to an area is what's kept decoded: the bot crops
+each subset to a box around `sites.tsv` (`.region.npz`), so later sites
+on that run read a few MB rather than decoding ~1 GB.
 
 Repeat requests are answered from earlier renders while those are still
 current (`replay.py`, index in `replay-index/` beside the images):
@@ -330,7 +345,8 @@ In the image, the cache and rendered PNG/SVGs live under `/data` and the
 site list is `sites.tsv` from this repo. The paths are set by
 `SOUNDING_CACHE_DIR`, `SOUNDING_OUTPUT_DIR` and `SOUNDING_SITES_FILE`,
 which default to the usual locations when unset. Nothing prunes `/data`,
-so it grows by roughly 900 MB per model run fetched.
+so it grows by roughly 300 MB per RRFS lead fetched (about 430 MB per
+HRRR lead).
 
 The image uses Debian's `libeccodes` rather than the `eccodeslib` wheel.
 That wheel's `eckitlib` dependency bundles its own `libproj`/`libsqlite3`,

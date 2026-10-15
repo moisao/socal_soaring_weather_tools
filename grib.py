@@ -9,6 +9,7 @@ shares none of this machinery."""
 import math
 import os
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -64,7 +65,10 @@ from config import CACHE_DIR
 # find on unstable days -- a convective equilibrium level sits nearer
 # 200-300 mb. Measured cost of going from 1000-400 to everything: RRFS
 # 125 -> 225 messages, 203 -> 320 MB; HRRR 125 -> 195, 88 -> 131 MB.
-ISOBARIC_SEARCH = r':(?:HGT|TMP|DPT|UGRD|VGRD):\d+ mb:'
+# Everything above 100 mb is stratosphere, though, which no equilibrium
+# level or cloud top reaches, so the pattern stops there: 1000 mb and
+# every three-digit level. That drops 40 RRFS messages (38 of 312 MB).
+ISOBARIC_SEARCH = r':(?:HGT|TMP|DPT|UGRD|VGRD):(?:1000|[1-9]\d\d) mb:'
 # Lower bound for the sanity check on how many messages the index
 # returned -- the 1000-400 mb band alone is 125, so anything near that
 # means the index is intact; the exact count now varies by model.
@@ -96,6 +100,51 @@ def _lcc_cone_constant(latin1, latin2):
                       / math.tan(math.radians(45 - latin2 / 2))))
 
 
+# The area a long-running caller serves, as (lat_min, lat_max, lon_min,
+# lon_max) in degrees -- the bot sets it around its named sites; None
+# everywhere else. See set_region().
+REGION = None
+# How far inside a region file's own edge a point has to be for that file
+# to answer it: any nearer and its nearest grid point could be one the
+# crop cut off. Two 3 km grid spacings.
+REGION_EDGE_DEG = 0.06
+
+# A full-grid decode holds ~1 GB, so only one runs at a time: the bot's
+# pre-warm thread and a request decoding at once could otherwise come to
+# twice that. Region files are small and skip this.
+_full_decode_lock = threading.Lock()
+# One lock per cache file, so two threads after the same file (a request
+# and the pre-warm) download it once between them rather than both
+# writing the same .part path.
+_path_locks = {}
+_path_locks_guard = threading.Lock()
+
+
+def _path_lock(path):
+    with _path_locks_guard:
+        return _path_locks.setdefault(str(path), threading.Lock())
+
+
+def set_region(region):
+    """Also keep a crop of every subset decoded from now on, covering
+    `region` (lat_min, lat_max, lon_min, lon_max), beside its GRIB2 as
+    <stub>.region.npz; a point inside it is then decoded from that
+    instead of the whole grid. None turns it off.
+
+    NOAA serves no subregion of these models to download -- NOMADS'
+    grib filter has no RRFS at all and only 7 HRRR pressure levels, and
+    a GRIB2 message is only readable whole -- so this saves no
+    bandwidth. What it saves is the decode: a SoCal crop is ~5 MB
+    against ~1 GB of full-grid arrays, so a request for a run already
+    on disk loads in milliseconds and barely moves the bot's memory."""
+    global REGION
+    REGION = region
+
+
+def _region_path(grib_path):
+    return grib_path.with_suffix('.region.npz')
+
+
 def _decode_grib_fields(grib_path, lat, lon):
     """Decode a cached GRIB2 subset (from _fetch_grib_profile) into the
     per-level {shortName: value} dict the caller needs, at the grid point
@@ -121,8 +170,16 @@ def _decode_grib_fields(grib_path, lat, lon):
     The grid's lat/lon and the LCC cone constant/central meridian only
     need decoding once (identical for every message sharing a grid
     definition, which every message in one of these subsets does) --
-    not once per level/variable."""
-    lats, lons, cone, lov, values, tree = _load_fields(grib_path)
+    not once per level/variable.
+
+    Read from the subset's region crop instead when it has one covering
+    (lat, lon) -- see set_region."""
+    with _path_lock(grib_path):
+        fields = _load_region(_region_path(grib_path), lat, lon)
+        if fields is None:
+            with _full_decode_lock:
+                fields = _load_fields(grib_path)
+    lats, lons, cone, lov, values, tree = fields
     # lons is in eccodes' 0-360 convention (see the longitude-normalizing
     # comment below) -- query with the same convention, or a -180..180
     # input like -117 reads as numerically far from every real point in
@@ -188,8 +245,60 @@ def _load_fields(grib_path):
                 lov = eccodes.codes_get(gid, 'LoVInDegrees')
             eccodes.codes_release(gid)
 
+    if REGION is not None:
+        _write_region(_region_path(grib_path), REGION, lats, lons, cone, lov, values)
+
     tree = cKDTree(np.column_stack([lats, lons]))
     return lats, lons, cone, lov, values, tree
+
+
+def _write_region(region_path, region, lats, lons, cone, lov, values):
+    """Save the part of a decoded subset inside `region` (see set_region).
+    Uncompressed: it's small enough that zlib would only cost time."""
+    lat_min, lat_max, lon_min, lon_max = region
+    # lons are 0-360 here (see _decode_grib_fields), the region -180..180.
+    inside = ((lats >= lat_min) & (lats <= lat_max)
+              & (lons >= lon_min % 360) & (lons <= lon_max % 360))
+    if not inside.any():
+        return
+    # .part + rename, as for the downloads; np.savez appends ".npz" to a
+    # path that lacks it but not to an open file, hence the file object.
+    tmp_path = region_path.with_suffix('.npz.part')
+    with open(tmp_path, 'wb') as tmp:
+        np.savez(tmp, latitudes=lats[inside], longitudes=lons[inside],
+                 cone=np.float32(cone), lov=np.float32(lov),
+                 **{key: arr[inside] for key, arr in values.items()})
+    tmp_path.rename(region_path)
+    _read_region.cache_clear()
+
+
+@lru_cache(maxsize=8)
+def _read_region(region_path):
+    """A region file's contents in _load_fields' shape, or None if there
+    is no such file. Memoized like _load_fields, but cheap to hold."""
+    if not region_path.exists():
+        return None
+    with np.load(region_path) as cached:
+        lats, lons = cached['latitudes'], cached['longitudes']
+        cone, lov = float(cached['cone']), float(cached['lov'])
+        values = {k: cached[k] for k in cached.files
+                  if k not in ('latitudes', 'longitudes', 'cone', 'lov')}
+    tree = cKDTree(np.column_stack([lats, lons]))
+    return lats, lons, cone, lov, values, tree
+
+
+def _load_region(region_path, lat, lon):
+    """_read_region's fields if they cover (lat, lon) with REGION_EDGE_DEG
+    to spare, else None -- the caller then decodes the full grid."""
+    fields = _read_region(region_path)
+    if fields is None:
+        return None
+    lats, lons = fields[0], fields[1]
+    lon = lon % 360
+    if not (lats.min() + REGION_EDGE_DEG <= lat <= lats.max() - REGION_EDGE_DEG
+            and lons.min() + REGION_EDGE_DEG <= lon <= lons.max() - REGION_EDGE_DEG):
+        return None
+    return fields
 
 
 def clear_field_cache():
@@ -199,6 +308,7 @@ def clear_field_cache():
     a time -- the Telegram bot -- where the memo buys nothing across
     requests but would otherwise pin ~1 GB for the life of the service."""
     _load_fields.cache_clear()
+    _read_region.cache_clear()
 
 
 def _latest_available_run(model, max_tries=6):
@@ -301,11 +411,14 @@ SURFACE_PRODUCT = {'hrrr': 'sfc', 'rrfs': '2d'}
 # _fetch_native_levels, which already treats "not found" as "skip these,
 # isobaric-only is all there is").
 NATIVE_LEVEL_PRODUCT = {'hrrr': 'nat', 'rrfs': 'natlev'}
-# How many native levels to pull. All 50 of them: the lowest 15 reach
-# only ~3.5 km/667 mb, which covers the boundary layer but stops well
-# below the high cloud these are now also being used to see. Costs 90 ->
-# 300 messages, 139 -> 393 MB per run for HRRR.
-MAX_NATIVE_LEVEL = 50
+# How many native levels to pull. The lowest 15 reach only ~3.5 km/667
+# mb, which covers the boundary layer but stops well below the high cloud
+# these are now also being used to see; all 50 cost 90 -> 300 messages,
+# 139 -> 393 MB per run for HRRR. 38 is the top of that worth having, for
+# the same reason as the isobaric cutoff above: from level 39 up HRRR's
+# hybrid levels are pure pressure surfaces, 99 mb and above, identical
+# across the whole grid (measured). Stopping at 38 saves ~88 MB a run.
+MAX_NATIVE_LEVEL = 38
 
 # (model, run, lead) triples already found to publish no native levels,
 # so the same negative network probe isn't repeated for every point looked
@@ -372,33 +485,34 @@ def _fetch_surface_subset(model, cache_prefix, run_date, forecast_hour, session)
         return None
 
     cache_path = CACHE_DIR / f'{cache_prefix}_{run_date:%Y%m%d_%HZ}_f{forecast_hour:02d}.surface.grib2'
-    if not cache_path.exists():
-        h = Herbie(run_date.replace(tzinfo=None), model=model, product=product,
-                   fxx=forecast_hour, verbose=False)
-        if h.grib is None:
-            return None
+    with _path_lock(cache_path):
+        if not cache_path.exists():
+            h = Herbie(run_date.replace(tzinfo=None), model=model, product=product,
+                       fxx=forecast_hour, verbose=False)
+            if h.grib is None:
+                return None
 
-        search = (r':(?:TMP|DPT):2 m above ground:'
-                  r'|:(?:UGRD|VGRD):10 m above ground:'
-                  r'|:PRES:surface:')
-        inventory = h.inventory(search=search)
-        if len(inventory) < 5:
-            return None
+            search = (r':(?:TMP|DPT):2 m above ground:'
+                      r'|:(?:UGRD|VGRD):10 m above ground:'
+                      r'|:PRES:surface:')
+            inventory = h.inventory(search=search)
+            if len(inventory) < 5:
+                return None
 
-        def _fetch_one(row):
-            start = int(row.start_byte)
-            end = None if pd.isna(row.end_byte) else int(row.end_byte)
-            range_hdr = f'bytes={start}-{end}' if end is not None else f'bytes={start}-'
-            r = session.get(h.grib, headers={'Range': range_hdr}, timeout=60)
-            r.raise_for_status()
-            return r.content
+            def _fetch_one(row):
+                start = int(row.start_byte)
+                end = None if pd.isna(row.end_byte) else int(row.end_byte)
+                range_hdr = f'bytes={start}-{end}' if end is not None else f'bytes={start}-'
+                r = session.get(h.grib, headers={'Range': range_hdr}, timeout=60)
+                r.raise_for_status()
+                return r.content
 
-        tmp_path = cache_path.with_suffix('.grib2.part')
-        with ThreadPoolExecutor(max_workers=HRRR_FETCH_WORKERS) as ex:
-            with open(tmp_path, 'wb') as tmp:
-                for content in ex.map(_fetch_one, (row for _, row in inventory.iterrows())):
-                    tmp.write(content)
-        tmp_path.rename(cache_path)
+            tmp_path = cache_path.with_suffix('.grib2.part')
+            with ThreadPoolExecutor(max_workers=HRRR_FETCH_WORKERS) as ex:
+                with open(tmp_path, 'wb') as tmp:
+                    for content in ex.map(_fetch_one, (row for _, row in inventory.iterrows())):
+                        tmp.write(content)
+            tmp_path.rename(cache_path)
     return cache_path
 
 
@@ -482,35 +596,36 @@ def _fetch_native_subset(model, cache_prefix, run_date, forecast_hour, session):
     # not lat/lon) -- checked first so a run already on disk skips the
     # Herbie network probe entirely, same as the isobaric path below.
     cache_path = CACHE_DIR / f'{cache_prefix}_{run_date:%Y%m%d_%HZ}_f{forecast_hour:02d}.native.grib2'
-    if not cache_path.exists():
-        h = Herbie(run_date.replace(tzinfo=None), model=model, product=product,
-                  fxx=forecast_hour, verbose=False)
-        if h.grib is None:
-            _NATIVE_UNAVAILABLE.add(unavailable_key)
-            return None
+    with _path_lock(cache_path):
+        if not cache_path.exists():
+            h = Herbie(run_date.replace(tzinfo=None), model=model, product=product,
+                      fxx=forecast_hour, verbose=False)
+            if h.grib is None:
+                _NATIVE_UNAVAILABLE.add(unavailable_key)
+                return None
 
-        wanted_levels = '|'.join(str(lvl) for lvl in range(1, MAX_NATIVE_LEVEL + 1))
-        search = rf':(?:PRES|HGT|TMP|SPFH|UGRD|VGRD):(?:{wanted_levels}) hybrid level:'
-        inventory = h.inventory(search=search)
-        if len(inventory) < MAX_NATIVE_LEVEL * 6 * 0.9:
-            # missing more than expected -- treat as unavailable rather than guess
-            _NATIVE_UNAVAILABLE.add(unavailable_key)
-            return None
+            wanted_levels = '|'.join(str(lvl) for lvl in range(1, MAX_NATIVE_LEVEL + 1))
+            search = rf':(?:PRES|HGT|TMP|SPFH|UGRD|VGRD):(?:{wanted_levels}) hybrid level:'
+            inventory = h.inventory(search=search)
+            if len(inventory) < MAX_NATIVE_LEVEL * 6 * 0.9:
+                # missing more than expected -- treat as unavailable rather than guess
+                _NATIVE_UNAVAILABLE.add(unavailable_key)
+                return None
 
-        def _fetch_one(row):
-            start = int(row.start_byte)
-            end = None if pd.isna(row.end_byte) else int(row.end_byte)
-            range_hdr = f'bytes={start}-{end}' if end is not None else f'bytes={start}-'
-            r = session.get(h.grib, headers={'Range': range_hdr}, timeout=30)
-            r.raise_for_status()
-            return r.content
+            def _fetch_one(row):
+                start = int(row.start_byte)
+                end = None if pd.isna(row.end_byte) else int(row.end_byte)
+                range_hdr = f'bytes={start}-{end}' if end is not None else f'bytes={start}-'
+                r = session.get(h.grib, headers={'Range': range_hdr}, timeout=30)
+                r.raise_for_status()
+                return r.content
 
-        tmp_path = cache_path.with_suffix('.grib2.part')
-        with ThreadPoolExecutor(max_workers=HRRR_FETCH_WORKERS) as ex:
-            with open(tmp_path, 'wb') as tmp:
-                for content in ex.map(_fetch_one, (row for _, row in inventory.iterrows())):
-                    tmp.write(content)
-        tmp_path.rename(cache_path)
+            tmp_path = cache_path.with_suffix('.grib2.part')
+            with ThreadPoolExecutor(max_workers=HRRR_FETCH_WORKERS) as ex:
+                with open(tmp_path, 'wb') as tmp:
+                    for content in ex.map(_fetch_one, (row for _, row in inventory.iterrows())):
+                        tmp.write(content)
+            tmp_path.rename(cache_path)
     return cache_path
 
 
@@ -697,54 +812,55 @@ def _fetch_grib_profile(lat, lon, date, model, cache_prefix, forecast_hour=None,
     try:
         for _ in range(max_tries if (allow_retry or hold_valid_time is not None) else 1):
             candidate_path = CACHE_DIR / f'{cache_prefix}_{run_date:%Y%m%d_%HZ}_f{forecast_hour:02d}.grib2'
-            if candidate_path.exists():
+            with _path_lock(candidate_path):
+                if candidate_path.exists():
+                    grib_path = candidate_path
+                    break
+
+                h = Herbie(run_date.replace(tzinfo=None), model=model, product='prs',
+                          fxx=forecast_hour, verbose=False)
+                if h.grib is None:
+                    if hold_valid_time is not None:
+                        # Step back to an older run and lengthen the lead by the
+                        # same hour, so the valid time being asked for doesn't move.
+                        run_date -= timedelta(hours=1)
+                        forecast_hour = round((hold_valid_time - run_date).total_seconds() / 3600)
+                        continue
+                    if not allow_retry:
+                        raise RuntimeError(f'{model.upper()} run {run_date:%Y-%m-%d %HZ} has no '
+                                           f'f{forecast_hour:02d} forecast')
+                    run_date -= timedelta(hours=1)
+                    continue
+                url = h.grib
+
+                for fetch_subset in (_fetch_native_subset, _fetch_surface_subset):
+                    prefetch.submit(fetch_subset, model, cache_prefix, run_date, forecast_hour,
+                                    prefetch_session)
+
+                inventory = h.inventory(search=search)
+                if len(inventory) < MIN_ISOBARIC_MESSAGES:
+                    raise RuntimeError(f'{model.upper()} index missing expected messages for {run_date} '
+                                       f'({len(inventory)} < {MIN_ISOBARIC_MESSAGES})')
+
+                def _fetch_one(row):
+                    start = int(row.start_byte)
+                    end = None if pd.isna(row.end_byte) else int(row.end_byte)
+                    range_hdr = f'bytes={start}-{end}' if end is not None else f'bytes={start}-'
+                    r = session.get(url, headers={'Range': range_hdr}, timeout=30)
+                    r.raise_for_status()
+                    return r.content
+
+                # Written to a .part path and renamed only once complete, so a
+                # run interrupted mid-fetch can't leave a truncated file that a
+                # later call mistakes for a valid, complete cache entry.
+                tmp_path = candidate_path.with_suffix('.grib2.part')
+                with ThreadPoolExecutor(max_workers=HRRR_FETCH_WORKERS) as ex:
+                    with open(tmp_path, 'wb') as tmp:
+                        for content in ex.map(_fetch_one, (row for _, row in inventory.iterrows())):
+                            tmp.write(content)
+                tmp_path.rename(candidate_path)
                 grib_path = candidate_path
                 break
-
-            h = Herbie(run_date.replace(tzinfo=None), model=model, product='prs',
-                      fxx=forecast_hour, verbose=False)
-            if h.grib is None:
-                if hold_valid_time is not None:
-                    # Step back to an older run and lengthen the lead by the
-                    # same hour, so the valid time being asked for doesn't move.
-                    run_date -= timedelta(hours=1)
-                    forecast_hour = round((hold_valid_time - run_date).total_seconds() / 3600)
-                    continue
-                if not allow_retry:
-                    raise RuntimeError(f'{model.upper()} run {run_date:%Y-%m-%d %HZ} has no '
-                                       f'f{forecast_hour:02d} forecast')
-                run_date -= timedelta(hours=1)
-                continue
-            url = h.grib
-
-            for fetch_subset in (_fetch_native_subset, _fetch_surface_subset):
-                prefetch.submit(fetch_subset, model, cache_prefix, run_date, forecast_hour,
-                                prefetch_session)
-
-            inventory = h.inventory(search=search)
-            if len(inventory) < MIN_ISOBARIC_MESSAGES:
-                raise RuntimeError(f'{model.upper()} index missing expected messages for {run_date} '
-                                   f'({len(inventory)} < {MIN_ISOBARIC_MESSAGES})')
-
-            def _fetch_one(row):
-                start = int(row.start_byte)
-                end = None if pd.isna(row.end_byte) else int(row.end_byte)
-                range_hdr = f'bytes={start}-{end}' if end is not None else f'bytes={start}-'
-                r = session.get(url, headers={'Range': range_hdr}, timeout=30)
-                r.raise_for_status()
-                return r.content
-
-            # Written to a .part path and renamed only once complete, so a
-            # run interrupted mid-fetch can't leave a truncated file that a
-            # later call mistakes for a valid, complete cache entry.
-            tmp_path = candidate_path.with_suffix('.grib2.part')
-            with ThreadPoolExecutor(max_workers=HRRR_FETCH_WORKERS) as ex:
-                with open(tmp_path, 'wb') as tmp:
-                    for content in ex.map(_fetch_one, (row for _, row in inventory.iterrows())):
-                        tmp.write(content)
-            tmp_path.rename(candidate_path)
-            grib_path = candidate_path
-            break
         else:
             if hold_valid_time is not None:
                 raise RuntimeError(

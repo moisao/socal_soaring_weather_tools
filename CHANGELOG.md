@@ -145,7 +145,25 @@ Profiled, about a third of that was not fetching at all:
   stepping back an hour at a time (~1.1 s a miss, often three misses).
 
 Same profile, row for row; 157 → 80 s cold on the M1, where nearly
-all of what's left is downloading 312 MB.
+all of what's left is downloading 312 MB. Then, to get the download
+itself out of the way:
+
+- **Nothing above 100 mb.** Isobaric levels stop at 100 mb and HRRR's
+  native levels at 38 (~112 mb; from 39 up they're pure pressure
+  surfaces at 99 mb and above). Stratosphere only — no EL or cloud top
+  gets there — and 38 MB off an RRFS lead, ~88 MB off HRRR's natives.
+- **Pre-warm.** `SOUNDING_PREWARM="6-20"` has the bot fetch the freshest
+  run for this hour and the next in the background, so a `/site` finds
+  it on disk: ~4 s instead of a minute-plus. Per-file locks make a
+  request that arrives mid-download wait for that download rather than
+  start its own.
+- **Region crop.** The hope was to download only SoCal, but nothing
+  serves these models by area: NOMADS' grib filter has no RRFS, and only
+  7 HRRR pressure levels; RRFS's smallest domain covering SoCal is
+  CONUS; HRRR-Zarr's pressure levels are analyses only. So the crop is
+  of what's kept: each decoded subset leaves a `.region.npz` of the box
+  around `sites.tsv` (~9 MB), and later sites on that run decode from it
+  in ~0.6 s instead of ~6 s, without the ~1 GB of full-grid arrays.
 
 ## Also found along the way
 
