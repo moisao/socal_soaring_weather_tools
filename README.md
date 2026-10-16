@@ -74,6 +74,7 @@ Four cases, checked in order:
 | `point_forecast.py` | A site's whole day: per-hour fetch, thermal top, updraft, wind |
 | `forecast_table.py` | The point forecast's two tables, drawn |
 | `telegram_bot.py` | Telegram front end |
+| `metrics.py` | Per-command log lines and Prometheus metrics for the bot |
 
 The two source modules are named for their *access mechanism*, not their
 model, because that's the real difference: `grib.py` does byte-range
@@ -302,6 +303,35 @@ Forecast images carry their run in the name
 (`RRFS_…_20261004_11Z_run20261004_00Z.png`), so one run's forecast
 never overwrites another's. A new version of the code re-renders
 everything rather than replaying old-looking plots.
+
+### Logs and metrics
+
+Every command is logged twice: as it arrives, and with its outcome and
+how long the reply took.
+
+```
+2026-10-16 09:12:03 INFO commands: /pf lb 17 from @kevin (chat 42)
+2026-10-16 09:12:07 INFO commands: /pf lb 17 -> ok in 4.2s [site=Little Black, model=rrfs, day=1]: RRFS 3 km, runs 16 06Z, 0 MB downloaded
+```
+
+Outcomes are `ok`, `bad_request` (couldn't read the command),
+`unavailable` (the data doesn't exist yet, or the archive is down),
+`timeout` and `error` (the bot failed).
+
+With `METRICS_PORT` set, the same is served for Prometheus on
+`:<port>/metrics`:
+
+| Metric | Labels |
+|---|---|
+| `soaring_bot_commands_total` | `command`, `outcome` |
+| `soaring_bot_response_seconds` (histogram) | `command`, `outcome` |
+| `soaring_bot_requests_total` — successful commands only | `command`, `site`, `model`, `day` (days ahead: `past`, `0`…`6`, `7+`) |
+
+Labels are kept to a fixed set, with every combination created at zero
+on start-up, because PromQL's `increase()` can't see a series' first
+increment and at a few commands a day most series would be exactly that.
+A station typed into `/sounding` that doesn't look like one is counted as
+`other`.
 
 ### Running it as a service
 

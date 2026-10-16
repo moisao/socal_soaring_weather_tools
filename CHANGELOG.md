@@ -181,6 +181,15 @@ itself out of the way:
   errors are retried (3 s, then 10 s) and then reported as the archive
   failing.
 
+## Command logging and metrics
+
+- Each command is logged as it arrives and again with its outcome, how
+  long the reply took and what it was for; log lines carry timestamps.
+- `metrics.py`: Prometheus counters and a response-time histogram per
+  command and outcome, plus the site, model and days ahead of successful
+  ones, served on `METRICS_PORT`. Every label combination starts at zero
+  so `increase()` sees the first request too.
+
 ## Also found along the way
 
 - 1000 mb is the highest isobaric level either model publishes; there is

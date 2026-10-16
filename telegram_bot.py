@@ -31,6 +31,11 @@ it doesn't push anywhere on its own.
 SOUNDING_PREWARM="6-20" fetches each new model run for this hour and
 the next ahead of any /site, between those local hours (inclusive);
 unset, nothing is fetched until asked for. See _prewarm_loop.
+
+Every command is logged as it arrives and again with its outcome and how
+long the reply took ("/pf lb 17 -> ok in 4.2s [site=Little Black, ...]"),
+and counted for Prometheus on METRICS_PORT when that is set -- see
+metrics.py.
 """
 
 import asyncio
@@ -53,12 +58,16 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 import forecast_table
 import grib
+import metrics
 import point_forecast
 import Simple_Sounding
+import wyoming
 from replay import ReplayIndex
 from wyoming import latest_synoptic_time
 
-logging.basicConfig(level=logging.INFO)
+# With the time on every line, so a command can be found by when it ran
+# without kubectl --timestamps.
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
 # httpx logs every request at INFO, and the Telegram API puts the bot
 # token in the URL path -- so at INFO the token gets written in clear
 # text to wherever this bot's output is redirected. Kept at WARNING so
@@ -184,8 +193,9 @@ class BadArguments(Exception):
     """Arguments argparse refused, carrying its own complaint as text."""
 
 
-def _render(argv: list) -> Path:
-    """Blocking: build arguments from argv, render, return the PNG path.
+def _render(argv: list) -> tuple:
+    """Blocking: build arguments from argv, render, return the PNG path
+    and whether it was replayed rather than drawn.
 
     Runs on a worker thread (see _render_and_reply) because the whole
     fetch-and-plot is synchronous and slow enough -- seconds to minutes
@@ -215,7 +225,7 @@ def _render(argv: list) -> Path:
         replayed = REPLAY.lookup(args)
         if replayed is not None:
             logger.info('Replaying %s', replayed.name)
-            return replayed
+            return replayed, True
         try:
             rendered = Simple_Sounding.render(args, output_dir=OUTPUT_DIR)
         finally:
@@ -225,7 +235,7 @@ def _render(argv: list) -> Path:
             grib.clear_field_cache()
             _release_freed_memory()
         REPLAY.record(args, rendered)
-    return Path(f'{rendered.stub}.png')
+    return Path(f'{rendered.stub}.png'), False
 
 
 async def _render_and_reply(update: Update, argv: list, timeout: int, label: str) -> None:
@@ -233,30 +243,56 @@ async def _render_and_reply(update: Update, argv: list, timeout: int, label: str
     thread, then reply with the image or with whatever went wrong."""
     await update.message.reply_text(f'Fetching {label} sounding...')
 
+    command = metrics.current()
     try:
-        png = await asyncio.wait_for(asyncio.to_thread(_render, argv), timeout)
+        png, replayed = await asyncio.wait_for(asyncio.to_thread(_render, argv), timeout)
     except asyncio.TimeoutError:
         # Only stops waiting -- the worker thread itself can't be
         # cancelled, so it runs to completion and keeps the lock until
         # then. Further requests queue rather than failing.
+        command.done('timeout')
         await update.message.reply_text('Timed out fetching/plotting that sounding.')
         return
     except BadArguments as e:
+        command.done('bad_request', str(e))
         await update.message.reply_text(f'Bad arguments: {e}')
         return
     except Exception as e:
-        logger.exception('Sounding render failed')
+        # No data to be had -- an archive that's down, a launch or run
+        # that doesn't exist -- isn't the bot failing.
+        unavailable = isinstance(e, wyoming.ArchiveUnavailable) or str(e).startswith(
+            ('No recent sounding data', 'No model source available'))
+        if not unavailable:
+            logger.exception('Sounding render failed')
+        command.done('unavailable' if unavailable else 'error', f'{type(e).__name__}: {e}')
         await update.message.reply_text(f'Failed: {type(e).__name__}: {e}')
         return
 
     if not png.exists():
+        command.done('error', 'no image produced')
         await update.message.reply_text('Ran, but no image was produced.')
         return
 
+    # The model is the first part of a modeled render's name
+    # ("RRFS_32.99_-117.12_..."); an observed one starts with its station.
+    prefix = png.name.split('_')[0].lower()
+    command.ask(model=prefix if prefix in point_forecast.SOURCES else 'observed')
+    command.done('ok', f'{"replayed" if replayed else "rendered"} {png.name}')
     with open(png, 'rb') as photo:
         await update.message.reply_photo(photo)
 
 
+def _day_of(iso_text):
+    """metrics.DAYS bucket for a time chat_datetime produced, or None if
+    it couldn't make one (argparse will reject it shortly)."""
+    try:
+        when = datetime.fromisoformat(iso_text).astimezone(LOCAL_TZ)
+    except ValueError:
+        return None
+    return metrics.day_label(when, datetime.now(LOCAL_TZ).date())
+
+
+@metrics.tracked('sounding')
 async def sounding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
     # A named site is a flying site, not a radiosonde launch station: there
@@ -267,26 +303,33 @@ async def sounding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     match, remaining = match_site(args)
     if match is not None:
         suggestion = ' '.join(['/site', match[0], *remaining])
+        metrics.current().done('bad_request', f'a site, not a station: {suggestion}')
         await update.message.reply_text(f'Command failed: Did you mean {suggestion}?')
         return
 
     station = args[0] if len(args) >= 1 else 'NKX'
     argv = ['--station', station]
+    day = metrics.day_label(latest_synoptic_time().astimezone(LOCAL_TZ), datetime.now(LOCAL_TZ).date())
     if len(args) >= 2:
         argv += ['--datetime', chat_datetime(args[1])]
+        day = _day_of(argv[-1])
+    metrics.current().ask(site=metrics.station_label(station), day=day)
 
     await _render_and_reply(update, argv, timeout=120, label=station)
 
 
+@metrics.tracked('site')
 async def site(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
     if not args:
+        metrics.current().done('bad_request', 'no site')
         await update.message.reply_text(
             'Usage: /site <name> [datetime]\nSee /sites for the list of names.')
         return
 
     match, remaining = match_site(args)
     if match is None:
+        metrics.current().done('bad_request', 'unknown site')
         await update.message.reply_text(
             f'Unknown site {" ".join(args)!r}. See /sites for the list of names.')
         return
@@ -297,6 +340,7 @@ async def site(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # ~1.5 h late) can be up to ~4 h old: 11am's at 2pm.
     when = chat_datetime(' '.join(remaining)) if remaining else datetime.now(LOCAL_TZ).isoformat()
     argv = ['--lat', str(lat), '--lon', str(lon), '--name', name, '--datetime', when]
+    metrics.current().ask(site=name, day=_day_of(when))
 
     # A named site is a modeled (HRRR/RRFS/GFS) sounding, not the fast
     # Wyoming CSV archive /sounding uses -- a cold fetch (no cached GRIB2
@@ -321,15 +365,19 @@ def _render_point_forecast(name, lat, lon, day, models, progress):
                                                     output_dir=OUTPUT_DIR)
 
 
+@metrics.tracked('pf')
 async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
+    command = metrics.current()
     if not args:
+        command.done('bad_request', 'no site')
         await update.message.reply_text(
             'Usage: /pf <site> [day] [rrfs|hrrr|gfs]\nSee /sites for the list of names.')
         return
 
     match, remaining = match_site(args)
     if match is None:
+        command.done('bad_request', 'unknown site')
         await update.message.reply_text(
             f'Unknown site {" ".join(args)!r}. See /sites for the list of names.')
         return
@@ -339,6 +387,7 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # one it is point_forecast.DEFAULT_MODELS, RRFS and then HRRR.
     named = [word.lower() for word in remaining if word.lower() in point_forecast.SOURCES]
     if len(named) > 1:
+        command.done('bad_request', 'more than one model')
         await update.message.reply_text(f'Pick one model, not {" and ".join(named)}.')
         return
     models = named or None
@@ -349,6 +398,7 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         try:
             day = point_forecast.parse_day(' '.join(remaining), now.date())
         except ValueError:
+            command.done('bad_request', 'bad day')
             await update.message.reply_text(
                 f'Bad day {" ".join(remaining)!r}: try 17, sat, tomorrow or 2026-10-17.')
             return
@@ -360,6 +410,7 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if sun is not None and now > sun[1]:
             day += timedelta(days=1)
 
+    command.ask(site=name, day=metrics.day_label(day, now.date()))
     label = f'{name} point forecast for {day:%a %b} {day.day}'
     status = await update.message.reply_text(f'Fetching {label}...')
 
@@ -384,9 +435,11 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             asyncio.to_thread(_render_point_forecast, name, lat, lon, day, models, progress),
             1800)
     except asyncio.TimeoutError:
+        command.done('timeout')
         await update.message.reply_text('Timed out fetching that forecast.')
         return
     except point_forecast.Unavailable as e:
+        command.done('unavailable', str(e))
         hint = ''
         if models is None:
             # GFS is never a silent fallback (see DEFAULT_MODELS), so say
@@ -397,8 +450,14 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     except Exception as e:
         logger.exception('Point forecast failed')
+        command.done('error', f'{type(e).__name__}: {e}')
         await update.message.reply_text(f'Failed: {type(e).__name__}: {e}')
         return
+
+    command.ask(model=result.source.model)
+    command.done('ok', f'{result.source.label}, runs '
+                       + ', '.join(f'{run:%d %HZ}' for run in result.runs)
+                       + f', {result.downloaded_bytes / 1e6:.0f} MB downloaded')
 
     newest = result.runs[-1].astimezone(LOCAL_TZ)
     caption = (f'{name}, {day:%a %b} {day.day} \N{EM DASH} {result.source.label}, '
@@ -412,9 +471,11 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await status.delete()
 
 
+@metrics.tracked('sites')
 async def list_sites(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sites = load_sites()
     if not sites:
+        metrics.current().done('unavailable', 'no sites.tsv')
         await update.message.reply_text('No named sites configured (sites.tsv not found or empty).')
         return
     lines = [f'{name} ({", ".join(aliases)})' if aliases else name
@@ -493,6 +554,8 @@ def main() -> None:
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     if not token:
         raise SystemExit('Set TELEGRAM_BOT_TOKEN in the environment first.')
+
+    metrics.initialise([name for name, _, _, _ in load_sites()], os.environ.get('METRICS_PORT'))
 
     # Set here as well as by the pre-warm, so a cold request's decode
     # leaves a region crop behind for the next site even with it off.
