@@ -21,7 +21,7 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 
 from config import utc_offset_label
-from point_forecast import ALTITUDE_STEP_FT, M_TO_FT
+from point_forecast import ALTITUDE_STEP_FT, M_TO_FT, daylight_hours
 
 # Units the tables are in. Altitude is always feet (ALTITUDE_STEP_FT).
 WIND_UNIT, KT_TO_WIND = 'mph', 1.150779
@@ -171,9 +171,31 @@ def _clock(dt):
     return f'{dt:%I:%M}'.lstrip('0') + f'{dt:%p}'.lower()
 
 
-def _hour_row(table, hours, tz):
-    table.row('', [{'text': _hour_label(hour.valid.astimezone(tz)), 'color': SECONDARY,
-                    'weight': 'bold', 'size': 8} for hour in hours])
+def _columns(forecast):
+    """(valid time, Hour or None) for every hour the sun is up. An hour
+    the model has no output for -- GFS past f120 is 3-hourly -- keeps its
+    column, left empty, rather than the next one closing the gap: the
+    columns stay an hour apart, so a 3-hour step reads as one."""
+    by_valid = {hour.valid: hour for hour in forecast.hours}
+    valid_times = set(daylight_hours(forecast.lat, forecast.lon, forecast.day)) | by_valid.keys()
+    return [(valid, by_valid.get(valid)) for valid in sorted(valid_times)]
+
+
+def _each(columns, cell):
+    """One cell per column: cell(hour), or empty where there's no hour."""
+    return [None if hour is None else cell(hour) for _, hour in columns]
+
+
+def _hour_row(table, columns, tz):
+    table.row('', [{'text': _hour_label(valid.astimezone(tz)),
+                    'color': SECONDARY if hour is not None else HAIRLINE,
+                    'weight': 'bold', 'size': 8} for valid, hour in columns])
+
+
+def _gap_note(forecast, columns):
+    if any(hour is None for _, hour in columns):
+        return [f'Empty columns: {forecast.source.label} has no output at those hours.']
+    return []
 
 
 def _altitudes(bottom_m, top_m):
@@ -217,20 +239,19 @@ def _grid_top_m(forecast):
 
 def _thermal_table(forecast, tz, name, path):
     hours = forecast.hours
-    table = _Table(len(hours))
-    _hour_row(table, hours, tz)
-    table.row('Top of lift (ft)', [
+    columns = _columns(forecast)
+    table = _Table(len(columns))
+    _hour_row(table, columns, tz)
+    table.row('Top of lift (ft)', _each(columns, lambda hour: (
         {'text': _feet(hour.top_m), 'weight': 'bold'} if hour.top_m is not None
-        else {'text': '\N{EN DASH}', 'color': MUTED} for hour in hours], label_color=INK, bold=True)
-    table.row('Cumulus base (ft)', [
+        else {'text': '\N{EN DASH}', 'color': MUTED})), label_color=INK, bold=True)
+    table.row('Cumulus base (ft)', _each(columns, lambda hour: (
         {'text': _feet(hour.cu_base_m)} if hour.cu_base_m is not None
-        else {'text': 'blue', 'color': MUTED} if hour.top_m is not None else None
-        for hour in hours])
+        else {'text': 'blue', 'color': MUTED} if hour.top_m is not None else None)))
     for label, layer in (('High cloud (%)', 2), ('Mid cloud (%)', 1), ('Low cloud (%)', 0)):
-        table.row(label, [
+        table.row(label, _each(columns, lambda hour, layer=layer: (
             None if hour.cloud[layer] is None
-            else {'text': f'{hour.cloud[layer]:.0f}', 'fill': CLOUD_RAMP(hour.cloud[layer] / 100)}
-            for hour in hours])
+            else {'text': f'{hour.cloud[layer]:.0f}', 'fill': CLOUD_RAMP(hour.cloud[layer] / 100)})))
 
     table.gap()
     table.heading(f'Thermal updraft ({LIFT_UNIT}) by altitude (ft MSL)')
@@ -240,7 +261,10 @@ def _thermal_table(forecast, tz, name, path):
     for feet in _altitudes(surface, top):
         metres = feet / M_TO_FT
         cells = []
-        for hour in hours:
+        for _, hour in columns:
+            if hour is None:
+                cells.append(None)
+                continue
             lift = hour.lift_at(metres)
             in_layer = hour.top_m is not None and metres < hour.top_m
             if hour.cu_base_m is not None and 0 <= metres - hour.cu_base_m < ALTITUDE_STEP_FT / M_TO_FT:
@@ -256,9 +280,9 @@ def _thermal_table(forecast, tz, name, path):
                 cells.append(None)
         label, color, major = _altitude_label(feet)
         table.row(label, cells, label_color=color, bold=major)
-    table.row(f'ground {_feet(surface, 10)}', [None] * len(hours), label_color=MUTED)
+    table.row(f'ground {_feet(surface, 10)}', [None] * len(columns), label_color=MUTED)
     table.gap(0.15)
-    _hour_row(table, hours, tz)
+    _hour_row(table, columns, tz)
 
     footer = ['Updraft is the air in a thermal core (w* with Lenschow\'s height profile); '
               'your climb is that less your sink rate.',
@@ -268,6 +292,7 @@ def _thermal_table(forecast, tz, name, path):
     if any(hour.wstar is None for hour in hours):
         footer.append('Grey cells: thermals reach here, but the model gave no heat flux to '
                       'size them with.')
+    footer += _gap_note(forecast, columns)
     title, subtitle = _titles(forecast, tz, name, 'thermals')
     table.draw(title, subtitle, footer, path)
 
@@ -278,35 +303,35 @@ def _wind_cell(direction, speed_kt):
 
 
 def _wind_table(forecast, tz, name, path):
-    hours = forecast.hours
-    table = _Table(len(hours))
-    _hour_row(table, hours, tz)
-    surface = hours[0].surface_m
+    columns = _columns(forecast)
+    table = _Table(len(columns))
+    _hour_row(table, columns, tz)
+    surface = forecast.hours[0].surface_m
     altitudes = _altitudes(surface, _grid_top_m(forecast))
     first_row = len(table.rows)
     for feet in altitudes:
         cells = []
-        for hour in hours:
-            wind = hour.wind_at(feet / M_TO_FT)
+        for _, hour in columns:
+            wind = None if hour is None else hour.wind_at(feet / M_TO_FT)
             cells.append(None if wind is None else _wind_cell(*wind))
         label, color, major = _altitude_label(feet)
         table.row(label, cells, label_color=color, bold=major)
     table.gap(0.15)
-    table.row(f'Surface, {_feet(surface, 10)} ft', [_wind_cell(*hour.surface_wind) for hour in hours],
-              label_color=INK, bold=True)
-    table.row('Gust', [None if hour.gust_kt is None
-                       else {'text': f'{hour.gust_kt * KT_TO_WIND:.0f}',
-                             'fill': WIND_RAMP(min(hour.gust_kt / WIND_SCALE_KT, 1.))}
-                       for hour in hours])
+    table.row(f'Surface, {_feet(surface, 10)} ft',
+              _each(columns, lambda hour: _wind_cell(*hour.surface_wind)), label_color=INK, bold=True)
+    table.row('Gust', _each(columns, lambda hour: (
+        None if hour.gust_kt is None
+        else {'text': f'{hour.gust_kt * KT_TO_WIND:.0f}',
+              'fill': WIND_RAMP(min(hour.gust_kt / WIND_SCALE_KT, 1.))})))
     table.gap(0.15)
-    _hour_row(table, hours, tz)
+    _hour_row(table, columns, tz)
 
     def top_of_lift(ax):
         # A rule across each column at that hour's top of lift, so the
         # winds a thermal climbs through read apart from those above it.
         step = ALTITUDE_STEP_FT
-        for column, hour in enumerate(hours):
-            if hour.top_m is None or hour.top_m * M_TO_FT >= altitudes[0] + step:
+        for column, (_, hour) in enumerate(columns):
+            if hour is None or hour.top_m is None or hour.top_m * M_TO_FT >= altitudes[0] + step:
                 continue
             # Snapped to the gap above the highest row still inside the
             # lift (rows run highest first), where it can't strike through
@@ -321,6 +346,7 @@ def _wind_table(forecast, tz, name, path):
     footer = [f'Wind in {WIND_UNIT}; arrows point the way the air is moving.  '
               '\N{EM DASH} top of lift that hour.',
               'Altitudes are feet MSL. Surface is the model\'s terrain, with its 10 m wind.']
+    footer += _gap_note(forecast, columns)
     title, subtitle = _titles(forecast, tz, name, 'wind')
     table.draw(title, subtitle, footer, path)
 
