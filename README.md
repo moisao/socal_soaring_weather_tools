@@ -221,7 +221,7 @@ Everything lands in `cache/` (git-ignored):
 | `<...>.region.npz` | The bot's sites' area, cropped out of any of those three once decoded — a few MB instead of ~1 GB to decode for the next site (`grib.set_region`) |
 | `<MODEL>_terrain.npz` | Orography — static, so cached once per model rather than per run |
 | `<MODEL>_<run>_f<lead>.point.grib2` | Point-forecast messages for that hour; appended to as other sites ask for other levels |
-| `<...>.point.json` | What that file holds, in order |
+| `<...>.point.json` | What that file holds, in order, and each site's values decoded from it — so a repeat request decodes nothing |
 
 Fetches write to a `.part` file and rename on completion, so an
 interrupted run can't leave a truncated file that looks complete. The

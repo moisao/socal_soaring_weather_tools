@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date as date_cls
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -218,17 +219,25 @@ def _resolve(source, valid_times):
     if min(valid_times) - now > timedelta(hours=source.max_lead):
         return {}
     latest = _latest_run(source)
-    resolved = {}
-    for valid in valid_times:
+
+    def resolve(valid):
         run = min(latest, valid)
         run -= timedelta(hours=run.hour % source.cycle_hours)
         for _ in range(source.max_step_back):
             lead = round((valid - run).total_seconds() / 3600)
             if source.lead_exists(lead) and _is_posted(source, run, lead):
-                resolved[valid] = (run, lead)
-                break
+                return run, lead
             run -= timedelta(hours=source.cycle_hours)
-    return resolved
+        return None
+
+    # Every hour's walk at once: each step is a ~0.6 s round trip to the
+    # bucket, and one at a time a day of them came to ~8 s whenever the
+    # misses had aged out of _missing_from. The memos are plain dicts and
+    # only ever hints, so threads racing on them can at worst repeat a
+    # lookup.
+    with ThreadPoolExecutor(max_workers=len(valid_times)) as pool:
+        answers = dict(zip(valid_times, pool.map(resolve, valid_times)))
+    return {valid: answer for valid, answer in answers.items() if answer is not None}
 
 
 ###########################################
@@ -284,13 +293,18 @@ class HourFile:
         stem = f'{source.cache_prefix}_{run:%Y%m%d_%HZ}_f{lead:03d}.point'
         self.grib_path = CACHE_DIR / f'{stem}.grib2'
         self.index_path = CACHE_DIR / f'{stem}.json'
-        self.index = {'size': 0, 'messages': [], 'absent': []}
+        self.index = {'size': 0, 'messages': [], 'absent': [], 'points': {}}
         try:
             index = json.loads(self.index_path.read_text())
             if self.grib_path.stat().st_size >= index['size']:
-                self.index = index
+                self.index = {'points': {}, **index}
         except (OSError, ValueError, KeyError):
             pass
+
+    def _save_index(self):
+        tmp = self.index_path.with_suffix('.json.part')
+        tmp.write_text(json.dumps(self.index))
+        os.replace(tmp, self.index_path)
 
     def labels(self):
         return {message['label'] for message in self.index['messages']}
@@ -343,9 +357,7 @@ class HourFile:
                 os.fsync(f.fileno())
             self.index['messages'] += messages
             self.index['size'] += sum(len(blob) for blob in blobs)
-        tmp = self.index_path.with_suffix('.json.part')
-        tmp.write_text(json.dumps(self.index))
-        os.replace(tmp, self.index_path)
+        self._save_index()
         return sum(len(blob) for blob in blobs)
 
     def decode(self, lat, lon, labels=None):
@@ -357,7 +369,22 @@ class HourFile:
         Decodes one message at a time and keeps one number from each, so
         nothing the size of the grid outlives its own message -- unlike
         grib._load_fields, which holds a whole run in memory to serve a
-        batch of sites and has no reason to here."""
+        batch of sites and has no reason to here.
+
+        The numbers are kept in the sidecar, per point, so asking again
+        decodes nothing: each message is a whole-grid decode (~11 ms), and
+        a day of them was ~7 s of every repeat request. A message's value
+        at a point never changes, so they need no invalidating; a label
+        appended since is simply decoded the next time it's asked for."""
+        key = f'{lat:.5f},{lon:.5f}'
+        cached = self.index['points'].get(key, {'_times': {}})
+        wanted = {m['label'] for m in self.index['messages']} if labels is None else set(labels)
+        if wanted & self.labels() <= cached.keys():
+            point = {k: v for k, v in cached.items() if k.startswith('_') and k != '_times'}
+            point['_times'] = {k: v for k, v in cached['_times'].items() if k in wanted}
+            point.update({k: v for k, v in cached.items() if k in wanted})
+            return point
+
         point = {'_times': {}}
         with open(self.grib_path, 'rb') as f:
             for message in self.index['messages']:
@@ -366,7 +393,11 @@ class HourFile:
                     raise RuntimeError(f'{self.grib_path.name} is shorter than its index')
                 try:
                     label = message['label']
-                    if labels is not None and label not in labels:
+                    if label not in wanted:
+                        continue
+                    if label in cached:
+                        point[label] = cached[label]
+                        point['_times'][label] = cached['_times'][label]
                         continue
                     index, point['_lat'], point['_lon'] = _nearest_grid_point(
                         self.source.model, gid, lat, lon)
@@ -379,7 +410,24 @@ class HourFile:
                         point['_lov'] = eccodes.codes_get(gid, 'LoVInDegrees')
                 finally:
                     eccodes.codes_release(gid)
+        # Everything cached has to come along, or a point that only ever
+        # re-read cached labels would lose its grid point and rotation.
+        times = {**cached.get('_times', {}), **point['_times']}
+        point = {**{k: v for k, v in cached.items() if k.startswith('_')}, **point}
+        cached.update({k: v for k, v in point.items() if k != '_times'})
+        cached['_times'] = times
+        self.index['points'][key] = cached
+        self._save_index()
+        point['_times'] = {k: v for k, v in cached['_times'].items() if k in wanted}
         return point
+
+
+@lru_cache(maxsize=256)
+def _terrain_height(model, lat, lon):
+    """grib._fetch_terrain_height, memoized: it loads the model's whole
+    orography and builds a KD-tree over it on every call (~0.6 s), for an
+    answer that never changes."""
+    return grib._fetch_terrain_height(model, lat, lon)
 
 
 def _surface_labels(source):
@@ -756,7 +804,7 @@ def forecast(lat, lon, day, models=None, progress=None):
         if source.terrain_in_file:
             terrain_height = next(iter(surface.values()))[TERRAIN_LABEL]
         else:
-            terrain_height = grib._fetch_terrain_height(source.model, lat, lon)
+            terrain_height = _terrain_height(source.model, lat, lon)
 
         surface_pressures = [point['PRES:surface'] / 100. for point in surface.values()]
 

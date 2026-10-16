@@ -165,6 +165,22 @@ itself out of the way:
   around `sites.tsv` (~9 MB), and later sites on that run decode from it
   in ~0.6 s instead of ~6 s, without the ~1 GB of full-grid arrays.
 
+## Repeat requests and a busy archive
+
+- A repeat `/pf` took 30 s+ with everything already downloaded: every
+  cached GRIB2 message was decoded again (~7 s — each is a whole-grid
+  decode), the hours' runs were looked up one at a time (~8 s once the
+  misses aged out), and the terrain KD-tree was rebuilt each time. Each
+  site's decoded values are now kept in the `.point.json` sidecar, the
+  hours are looked up in parallel, and terrain is memoized: measured in
+  the pod, a repeat is ~2 s in the bot, ~8 s from a cold process.
+- `/sounding` failed with "No recent sounding data" while the Wyoming
+  archive was answering *503: the server is too busy*. siphon turns every
+  HTTP error into the same bare `ValueError`, so a busy server read as
+  four missing launches in a row. Only a 404 means "not launched"; other
+  errors are retried (3 s, then 10 s) and then reported as the archive
+  failing.
+
 ## Also found along the way
 
 - 1000 mb is the highest isobaric level either model publishes; there is
