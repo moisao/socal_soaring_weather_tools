@@ -213,6 +213,19 @@ itself out of the way:
   mixing through launch height; before, a morning jet just above the hill
   read as 40+ mph launch gusts. RRFS gusts now track xcskies' within a few mph.
 
+## Point forecasts drawn ahead
+
+- A `/pf` was cold most times it was asked: each RRFS run that posts
+  moves the rest of the day onto new files, ~0.5–1.6 GB and 40–90 s a
+  day. Drawn tables are now kept for as long as the same runs answer
+  every hour of the day (`point_forecast.plan_day` says which, in a few
+  lookups), and `POINT_FORECAST_PREWARM` draws every site's today and
+  tomorrow as each new run lands, so a request finds them done.
+- `HourFile.decode_points` reads one whole-grid unpack for any number of
+  sites. Drawing all 17 sites' two days cold took 532 s one site at a
+  time and 262 s priming the rest from each one's pass; the tables come
+  out byte-identical.
+
 ## Also found along the way
 
 - 1000 mb is the highest isobaric level either model publishes; there is

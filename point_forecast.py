@@ -364,62 +364,80 @@ class HourFile:
         """{label: value at the grid point nearest (lat, lon)} for the
         labels asked for (all of them by default), plus that grid point
         under '_lat'/'_lon' and, on a Lambert grid, '_cone'/'_lov' for
-        turning its grid-relative winds to true north.
+        turning its grid-relative winds to true north."""
+        return self.decode_points([(lat, lon)], labels)[0]
 
-        Decodes one message at a time and keeps one number from each, so
-        nothing the size of the grid outlives its own message -- unlike
-        grib._load_fields, which holds a whole run in memory to serve a
-        batch of sites and has no reason to here.
+    def decode_points(self, points, labels=None):
+        """decode() for several (lat, lon) at once, in their order.
+
+        Decodes one message at a time and keeps one number per point from
+        each, so nothing the size of the grid outlives its own message --
+        unlike grib._load_fields, which holds a whole run in memory to
+        serve a batch of sites and has no reason to here. Several points
+        cost what one does: the whole-grid unpack (~11 ms a message) is
+        the work, and picking more values out of it is nothing.
 
         The numbers are kept in the sidecar, per point, so asking again
-        decodes nothing: each message is a whole-grid decode (~11 ms), and
-        a day of them was ~7 s of every repeat request. A message's value
-        at a point never changes, so they need no invalidating; a label
-        appended since is simply decoded the next time it's asked for."""
-        key = f'{lat:.5f},{lon:.5f}'
-        cached = self.index['points'].get(key, {'_times': {}})
-        wanted = {m['label'] for m in self.index['messages']} if labels is None else set(labels)
-        if wanted & self.labels() <= cached.keys():
-            point = {k: v for k, v in cached.items() if k.startswith('_') and k != '_times'}
-            point['_times'] = {k: v for k, v in cached['_times'].items() if k in wanted}
-            point.update({k: v for k, v in cached.items() if k in wanted})
-            return point
+        decodes nothing: a day of messages was ~7 s of every repeat
+        request. A message's value at a point never changes, so they need
+        no invalidating; a label appended since is simply decoded the
+        next time it's asked for."""
+        wanted = self.labels() if labels is None else set(labels)
+        present = wanted & self.labels()
+        keys = [f'{lat:.5f},{lon:.5f}' for lat, lon in points]
+        cached = [self.index['points'].get(key) or {'_times': {}} for key in keys]
+        todo = [i for i, point in enumerate(cached) if not present <= point.keys()]
+        if todo:
+            with open(self.grib_path, 'rb') as f:
+                for message in self.index['messages']:
+                    gid = eccodes.codes_grib_new_from_file(f)
+                    if gid is None:
+                        raise RuntimeError(f'{self.grib_path.name} is shorter than its index')
+                    try:
+                        label = message['label']
+                        if label not in wanted:
+                            continue
+                        need = [i for i in todo if label not in cached[i]]
+                        if not need:
+                            continue
+                        grid = [_nearest_grid_point(self.source.model, gid, *points[i])
+                                for i in need]
+                        values = eccodes.codes_get_double_elements(
+                            gid, 'values', [index for index, _, _ in grid])
+                        lambert = None
+                        for i, (_, grid_lat, grid_lon), value in zip(need, grid, values):
+                            point = cached[i]
+                            point['_lat'], point['_lon'] = grid_lat, grid_lon
+                            point[label] = float(value)
+                            point['_times'][label] = message['time']
+                            if '_cone' not in point:
+                                if lambert is None:
+                                    lambert = eccodes.codes_get(gid, 'gridType') == 'lambert' and (
+                                        grib._lcc_cone_constant(
+                                            eccodes.codes_get(gid, 'Latin1InDegrees'),
+                                            eccodes.codes_get(gid, 'Latin2InDegrees')),
+                                        eccodes.codes_get(gid, 'LoVInDegrees'))
+                                if lambert:
+                                    point['_cone'], point['_lov'] = lambert
+                    finally:
+                        eccodes.codes_release(gid)
+            for i in todo:
+                self.index['points'][keys[i]] = cached[i]
+            self._save_index()
+        return [{**{k: v for k, v in point.items() if k.startswith('_') and k != '_times'},
+                 '_times': {k: v for k, v in point['_times'].items() if k in wanted},
+                 **{k: v for k, v in point.items() if k in wanted}}
+                for point in cached]
 
-        point = {'_times': {}}
-        with open(self.grib_path, 'rb') as f:
-            for message in self.index['messages']:
-                gid = eccodes.codes_grib_new_from_file(f)
-                if gid is None:
-                    raise RuntimeError(f'{self.grib_path.name} is shorter than its index')
-                try:
-                    label = message['label']
-                    if label not in wanted:
-                        continue
-                    if label in cached:
-                        point[label] = cached[label]
-                        point['_times'][label] = cached['_times'][label]
-                        continue
-                    index, point['_lat'], point['_lon'] = _nearest_grid_point(
-                        self.source.model, gid, lat, lon)
-                    point[label] = float(eccodes.codes_get_double_element(gid, 'values', index))
-                    point['_times'][label] = message['time']
-                    if '_cone' not in point and eccodes.codes_get(gid, 'gridType') == 'lambert':
-                        point['_cone'] = grib._lcc_cone_constant(
-                            eccodes.codes_get(gid, 'Latin1InDegrees'),
-                            eccodes.codes_get(gid, 'Latin2InDegrees'))
-                        point['_lov'] = eccodes.codes_get(gid, 'LoVInDegrees')
-                finally:
-                    eccodes.codes_release(gid)
-        # Everything cached has to come along, or a point that only ever
-        # re-read cached labels would lose its grid point and rotation.
-        times = {**cached.get('_times', {}), **point['_times']}
-        point = {**{k: v for k, v in cached.items() if k.startswith('_')}, **point}
-        cached.update({k: v for k, v in point.items() if k != '_times'})
-        cached['_times'] = times
-        self.index['points'][key] = cached
-        self._save_index()
-        point['_times'] = {k: v for k, v in cached['_times'].items() if k in wanted}
-        return point
+
+def prime(plan, points):
+    """Decode every message the plan's hour files hold, for all these
+    points at once, so that forecasts for them after this one decode
+    nothing they don't fetch themselves. For drawing many sites' days
+    in a row: separately, each site unpacks the same whole-grid messages
+    again (~10 s a site-day for RRFS)."""
+    for _, (run, lead) in plan.resolved:
+        HourFile(plan.source, run, lead).decode_points(points)
 
 
 @lru_cache(maxsize=256)
@@ -786,18 +804,26 @@ class PointForecast:
         return sorted({hour.run for hour in self.hours})
 
 
-def forecast(lat, lon, day, models=None, progress=None, launch_m=None):
-    """The point forecast for one local calendar day: an Hour for each
-    hour the sun is up, from the first model in `models` (default
-    DEFAULT_MODELS) with data for all of them -- or, if none has,
-    whichever covers the most.
+@dataclass(frozen=True)
+class Plan:
+    """Which model answers a day, and which run and lead each of its
+    hours comes from -- everything a forecast depends on besides the
+    point itself, and cheap to work out, so it can say whether an
+    earlier forecast of the same day is still current."""
+    source: Source
+    resolved: tuple             # ((valid time, (run, lead)), ...), in time order
+    sunrise: datetime
+    sunset: datetime
+
+
+def plan_day(lat, lon, day, models=None):
+    """The Plan for one local calendar day: the first model in `models`
+    (default DEFAULT_MODELS) with data for every hour the sun is up --
+    or, if none has, whichever covers the most.
 
     One model for the whole day rather than hour-by-hour fallback: a
     column from a different model is a discontinuity that reads as
-    weather. progress, if given, is called with (hours done, hours total)
-    as the fetch goes. launch_m, the launch's real elevation, is carried
-    along for the tables (Hour.launch_wind); nothing fetched depends on
-    it."""
+    weather."""
     valid_times = daylight_hours(lat, lon, day)
     if not valid_times:
         raise Unavailable(f'The sun does not rise and set at {lat:.2f}, {lon:.2f} on {day}')
@@ -823,6 +849,21 @@ def forecast(lat, lon, day, models=None, progress=None, launch_m=None):
         if len(tried) == 1:
             raise Unavailable(f"{tried[0]} doesn't reach {when} yet.")
         raise Unavailable('Neither ' + ' nor '.join(tried) + f' reaches {when} yet.')
+    return Plan(source, tuple(sorted(resolved.items())), sunrise, sunset)
+
+
+def forecast(lat, lon, day, models=None, progress=None, launch_m=None, plan=None):
+    """The point forecast for one local calendar day: an Hour for each
+    hour the sun is up, as planned by plan_day() (or by `plan`, if it has
+    been already).
+
+    progress, if given, is called with (hours done, hours total) as the
+    fetch goes. launch_m, the launch's real elevation, is carried along
+    for the tables (Hour.launch_wind); nothing fetched depends on it."""
+    if plan is None:
+        plan = plan_day(lat, lon, day, models)
+    source, resolved = plan.source, dict(plan.resolved)
+    sunrise, sunset = plan.sunrise, plan.sunset
 
     session = _session()
     files = {valid: HourFile(source, run, lead) for valid, (run, lead) in resolved.items()}

@@ -46,6 +46,7 @@ import io
 import logging
 import os
 import re
+import shutil
 import threading
 import time
 from collections import namedtuple
@@ -63,6 +64,7 @@ import metrics
 import point_forecast
 import Simple_Sounding
 import wyoming
+from config import CACHE_DIR
 from replay import ReplayIndex
 from wyoming import latest_synoptic_time
 
@@ -355,22 +357,71 @@ async def site(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _render_and_reply(update, argv, timeout=600, label=name)
 
 
-def _render_point_forecast(name, lat, lon, day, models, progress, launch_ft=None):
-    """Blocking: fetch one day's point forecast and draw its tables.
-    Returns (forecast, [thermals PNG, wind PNG]).
+# Point forecasts already drawn, so a repeat -- or one the pre-warm got
+# to first -- is a reply rather than a fetch: {(site, day, model): (plan,
+# forecast, PNG paths)}. Good while the plan is: one whose runs differ
+# (a newer run now answers some hour of the day) is drawn afresh and
+# replaces it.
+_drawn = {}
+# Drawn into the download cache, which the janitor prunes, rather than
+# the archive: most pre-drawn tables are never asked for. The ones sent
+# are copied into the archive as they go (see pointforecast).
+POINT_FORECAST_DIR = CACHE_DIR / 'point-forecast'
 
-    Under the render lock although nothing here touches pyplot: it shares
-    the download cache with /site, and two cold fetches at once would
-    only halve each other's bandwidth."""
+
+def _point_forecast_tables(site, day, models, progress=None, prime_for=()):
+    """Blocking: one site's day as (forecast, [thermals PNG, wind PNG],
+    whether it had been drawn already). prime_for: other sites about to
+    be asked for the same day, to decode this one's hours for in the same
+    pass (point_forecast.prime).
+
+    Planned first, outside the render lock -- a few lookups at most --
+    so a day already drawn from its current runs comes straight back,
+    whatever else is running. Otherwise fetched and drawn under the lock:
+    nothing here touches pyplot, but two at once would race on the same
+    cached hour files, and two cold fetches only halve each other's
+    bandwidth anyway."""
+    plan = point_forecast.plan_day(site.lat, site.lon, day, models)
+    key = (site, day, plan.source.model)
+
+    def drawn():
+        entry = _drawn.get(key)
+        if entry is not None and entry[0] == plan and all(path.exists() for path in entry[2]):
+            return entry[1], entry[2], True
+        return None
+
+    if (hit := drawn()) is not None:
+        return hit
     with _render_lock:
+        # The pre-warm may have drawn it while this waited.
+        if (hit := drawn()) is not None:
+            return hit
+        launch_m = site.elevation_ft / point_forecast.M_TO_FT if site.elevation_ft else None
         try:
-            result = point_forecast.forecast(
-                lat, lon, day, models=models, progress=progress,
-                launch_m=launch_ft / point_forecast.M_TO_FT if launch_ft else None)
+            result = point_forecast.forecast(site.lat, site.lon, day, progress=progress,
+                                             launch_m=launch_m, plan=plan)
+            if prime_for:
+                point_forecast.prime(plan, [(other.lat, other.lon) for other in prime_for])
         finally:
             _release_freed_memory()
-        return result, forecast_table.render_tables(result, LOCAL_TZ, name=name,
-                                                    output_dir=OUTPUT_DIR)
+        POINT_FORECAST_DIR.mkdir(parents=True, exist_ok=True)
+        paths = forecast_table.render_tables(result, LOCAL_TZ, name=site.name,
+                                             output_dir=POINT_FORECAST_DIR)
+        today = datetime.now(LOCAL_TZ).date()
+        for stale in [k for k in _drawn if k[1] < today]:
+            del _drawn[stale]
+        _drawn[key] = (plan, result, paths)
+    return result, paths, False
+
+
+def _point_forecast_day(site, now):
+    """The day a /pf without one means: the next daylight at the site --
+    today, until the sun has set on it."""
+    day = now.date()
+    sun = point_forecast.sun_times(site.lat, site.lon, day)
+    if sun is not None and now > sun[1]:
+        day += timedelta(days=1)
+    return day
 
 
 @metrics.tracked('pf')
@@ -389,7 +440,7 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(
             f'Unknown site {" ".join(args)!r}. See /sites for the list of names.')
         return
-    name, lat, lon = match.name, match.lat, match.lon
+    name = match.name
 
     # A model named anywhere after the site forces that one model; without
     # one it is point_forecast.DEFAULT_MODELS, RRFS and then HRRR.
@@ -411,12 +462,7 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 f'Bad day {" ".join(remaining)!r}: try 17, sat, tomorrow or 2026-10-17.')
             return
     else:
-        # No day means the next daylight there is: today, until the sun
-        # has set on it.
-        day = now.date()
-        sun = point_forecast.sun_times(lat, lon, day)
-        if sun is not None and now > sun[1]:
-            day += timedelta(days=1)
+        day = _point_forecast_day(match, now)
 
     command.ask(site=name, day=metrics.day_label(day, now.date()))
     label = f'{name} point forecast for {day:%a %b} {day.day}'
@@ -439,10 +485,8 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 status.edit_text(f'Fetching {label}... {percent}%'), loop)
 
     try:
-        result, paths = await asyncio.wait_for(
-            asyncio.to_thread(_render_point_forecast, name, lat, lon, day, models, progress,
-                              match.elevation_ft),
-            1800)
+        result, paths, drawn = await asyncio.wait_for(
+            asyncio.to_thread(_point_forecast_tables, match, day, models, progress), 1800)
     except asyncio.TimeoutError:
         command.done('timeout')
         await update.message.reply_text('Timed out fetching that forecast.')
@@ -466,7 +510,8 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     command.ask(model=result.source.model)
     command.done('ok', f'{result.source.label}, runs '
                        + ', '.join(f'{run:%d %HZ}' for run in result.runs)
-                       + f', {result.downloaded_bytes / 1e6:.0f} MB downloaded')
+                       + (', drawn already' if drawn else
+                          f', {result.downloaded_bytes / 1e6:.0f} MB downloaded'))
 
     newest = result.runs[-1].astimezone(LOCAL_TZ)
     caption = (f'{name}, {day:%a %b} {day.day} \N{EM DASH} {result.source.label}, '
@@ -474,6 +519,11 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     media = [InputMediaPhoto(path.read_bytes(), caption=caption if i == 0 else None)
              for i, path in enumerate(paths)]
     await update.message.reply_media_group(media)
+    # Into the archive with every other image sent (see POINT_FORECAST_DIR).
+    for path in paths:
+        with contextlib.suppress(OSError):
+            if not (OUTPUT_DIR / path.name).exists():
+                shutil.copyfile(path, OUTPUT_DIR / path.name)
     # The tables replace the progress counter, which would otherwise sit
     # above them stopped short of 100%.
     with contextlib.suppress(Exception):
@@ -498,8 +548,8 @@ PREWARM_INTERVAL = timedelta(minutes=5)
 
 
 def prewarm_hours(spec):
-    """The local hours a SOUNDING_PREWARM value like '6-20' covers
-    (inclusive), or an empty range when it's unset."""
+    """The local hours a SOUNDING_PREWARM or POINT_FORECAST_PREWARM value
+    like '6-20' covers (inclusive), or an empty range when it's unset."""
     if not spec:
         return range(0)
     start, end = (int(part) for part in spec.split('-'))
@@ -544,6 +594,46 @@ def _prewarm_loop(hours):
         time.sleep(PREWARM_INTERVAL.total_seconds())
 
 
+def _point_forecast_prewarm_loop(hours, days):
+    """Keep every site's point forecast for the next `days` days drawn
+    from the freshest runs, so a /pf is answered from tables already
+    drawn rather than waiting out the fetch -- which, with each new RRFS
+    run (3-hourly in the bucket) moving the rest of today onto it, most
+    requests would otherwise do.
+
+    The days and model are what a bare /pf asks for (_point_forecast_day,
+    DEFAULT_MODELS); a check that finds every plan unchanged is a few
+    lookups. Today first, for every site, then the day after: a run's
+    files are the whole grid, so the first site of a day downloads and
+    the rest mostly read what it decoded for them (prime_for). One
+    site-day at a time under the render lock, so a request waits behind
+    at most one of them."""
+    while True:
+        now = datetime.now(LOCAL_TZ)
+        if now.hour in hours:
+            sites = load_sites()
+            for ahead in range(days):
+                for site in sites:
+                    day = _point_forecast_day(site, now) + timedelta(days=ahead)
+                    started = time.monotonic()
+                    try:
+                        result, _, drawn = _point_forecast_tables(site, day, None,
+                                                                  prime_for=sites)
+                    except point_forecast.Unavailable:
+                        continue
+                    except Exception:
+                        logger.exception('Pre-drawing the %s point forecast for %s failed',
+                                         site.name, day)
+                        continue
+                    if not drawn:
+                        logger.info('Pre-drew the %s point forecast for %s: %s, runs %s, '
+                                    '%.0f MB downloaded, in %.1fs', site.name, f'{day:%a %b %d}',
+                                    result.source.label,
+                                    ', '.join(f'{run:%d %HZ}' for run in result.runs),
+                                    result.downloaded_bytes / 1e6, time.monotonic() - started)
+        time.sleep(PREWARM_INTERVAL.total_seconds())
+
+
 async def post_init(application: Application) -> None:
     # Registers the "/" autocomplete menu Telegram clients show while
     # typing -- without this the command still works, but no hint pops
@@ -573,6 +663,14 @@ def main() -> None:
     if hours:
         threading.Thread(target=_prewarm_loop, args=(hours,), name='prewarm', daemon=True).start()
         logger.info('Pre-warming model runs between %02d:00 and %02d:59', hours[0], hours[-1])
+
+    pf_hours = prewarm_hours(os.environ.get('POINT_FORECAST_PREWARM'))
+    if pf_hours:
+        pf_days = int(os.environ.get('POINT_FORECAST_PREWARM_DAYS') or 2)
+        threading.Thread(target=_point_forecast_prewarm_loop, args=(pf_hours, pf_days),
+                         name='pf-prewarm', daemon=True).start()
+        logger.info('Pre-drawing point forecasts %d day(s) ahead between %02d:00 and %02d:59',
+                    pf_days, pf_hours[0], pf_hours[-1])
 
     app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler('sounding', sounding))

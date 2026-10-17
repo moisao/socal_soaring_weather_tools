@@ -223,6 +223,7 @@ Everything lands in `cache/` (git-ignored):
 | `<MODEL>_terrain.npz` | Orography — static, so cached once per model rather than per run |
 | `<MODEL>_<run>_f<lead>.point.grib2` | Point-forecast messages for that hour; appended to as other sites ask for other levels |
 | `<...>.point.json` | What that file holds, in order, and each site's values decoded from it — so a repeat request decodes nothing |
+| `point-forecast/PF_*.png` | Point-forecast tables as drawn, sent or not; the ones sent are copied into the archive |
 
 Fetches write to a `.part` file and rename on completion, so an
 interrupted run can't leave a truncated file that looks complete. The
@@ -257,9 +258,10 @@ uses that model alone; without one it's RRFS, then HRRR. A bare number is a **da
 hour — the tables already cover every daylight hour — and no day means
 today, or tomorrow once the sun has set. A cold day is several hundred MB
 of GRIB2, so the "Fetching…" message counts up as it goes; a second site
-on the same runs reuses whatever messages are already down. It isn't
-replayed from `replay-index/` the way soundings are: a repeat re-reads the
-cached GRIB2, which takes seconds.
+on the same runs reuses whatever messages are already down. Tables once
+drawn are kept (in memory, PNGs in `cache/point-forecast/`) for as long
+as the same runs still answer every hour of that day, so a repeat is
+answered at once; a newer run reaching any hour means drawing it again.
 
 Named sites come from `../sites.tsv`: one tab-separated `name`, `lat`,
 `lon` per line, then optionally the launch elevation in whole feet MSL,
@@ -284,6 +286,18 @@ minutes between those local hours. A cold `/site` is mostly download
 (~280 MB of RRFS a lead); pre-warmed, it renders in about 4 s. That costs
 roughly 0.5–0.8 GB of downloads an hour while it's on. Unset, nothing is
 fetched until someone asks.
+
+`POINT_FORECAST_PREWARM="5-21"` does the same for `/pf`: every 5 minutes
+between those local hours it draws every site's point forecast for the
+day a bare `/pf` means and the day after (`POINT_FORECAST_PREWARM_DAYS`,
+default 2), skipping those whose runs haven't changed. RRFS's runs land
+in the bucket 3-hourly, ~1.5–2 h late; each one costs ~1–1.5 GB and a
+few minutes of fetching and decoding in the background, after which a
+`/pf` for any site is answered in about a second. Today's tables come
+first, for every site, then tomorrow's; each site-day decodes its hours
+for all the sites in one pass (`point_forecast.prime`), so after the
+first, most take a second or two. A request arriving mid-pass waits
+behind at most one site-day.
 
 No server offers these models cut to an area — NOMADS' grib filter has
 no RRFS and only 7 HRRR pressure levels — so every fetch is the whole
