@@ -266,7 +266,7 @@ Named sites come from `../sites.tsv`: one tab-separated `name`, `lat`,
 then optionally the other names the site goes by, comma-separated
 (`Little Black → lb`, `Torrey Pines → torrey`). Elevations are the San
 Diego HG/PG Association site guide's where it lists one, otherwise the
-terrain at the site's coordinates; Torrey Pines has none yet.
+terrain at the site's coordinates (Torrey Pines: 350 ft).
 Aliases work everywhere a name does — `/site lb 14`, `/pf torrey sat` —
 and `/sites` lists them beside each name. The parser splits on `\s+` rather than on tabs
 specifically, so space-aligned lines still work — but a site name may
@@ -411,9 +411,10 @@ and on Linux, loading it alongside pyproj's copies crashes
   depth of lift starts from the grid cell's terrain, which a 3 km model
   smooths and a 0.25° one flattens: RRFS has nothing above 206 m within
   6 km of Little Black, whose launch is at 357 m. With a launch elevation
-  in `sites.tsv` the wind table reads the model's wind at launch height
-  instead of its 10 m wind, and estimates the gust from it (see
-  `Hour.launch_gust_kt`); the tables mark launch with a rule.
+  in `sites.tsv`, the wind table's launch row is the model's 10 m wind and
+  its free-air rows start above launch; the gust is estimated from the
+  free air at launch height (see `Hour.launch_gust_kt`), and the thermals
+  table marks launch with a rule.
 - **1000 mb is the floor**, so a sounding at a below-sea-level or
   very-high-pressure site has no isobaric level beneath that. The surface
   row now covers the bottom regardless.

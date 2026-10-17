@@ -336,7 +336,10 @@ def _wind_table(forecast, tz, name, path):
     table = _Table(len(columns))
     _hour_row(table, columns, tz)
     surface = forecast.hours[0].surface_m
-    altitudes = _altitudes(surface, _grid_top_m(forecast))
+    launch = _launch_above_ground(forecast)
+    # With a launch elevation, the free-air rows start above it: the
+    # launch row below stands for everything from the ground up to launch.
+    altitudes = _altitudes(launch if launch is not None else surface, _grid_top_m(forecast))
     first_row = len(table.rows)
     for feet in altitudes:
         cells = []
@@ -346,15 +349,18 @@ def _wind_table(forecast, tz, name, path):
         label, color, major = _altitude_label(feet)
         table.row(label, cells, label_color=color, bold=major)
     table.gap(0.15)
-    launch = _launch_above_ground(forecast)
 
     def gust_cell(gust_kt):
         return None if gust_kt is None else {
             'text': f'{gust_kt * KT_TO_WIND:.0f}', 'fill': WIND_RAMP(min(gust_kt / WIND_SCALE_KT, 1.))}
 
     if launch is not None:
+        # The model's 10 m wind, not its free air at launch height: on the
+        # stations at Little Black (Holfuy and WeatherXM, 2026-10-16/17)
+        # the 10 m wind was the closer of the two in three comparisons out
+        # of four, where the free air carried the models' morning jet.
         table.row(f'Launch, {_feet(launch, 10)} ft',
-                  _each(columns, lambda hour: _wind_cell(*hour.launch_wind(launch))),
+                  _each(columns, lambda hour: _wind_cell(*hour.surface_wind)),
                   label_color=INK, bold=True)
         table.row('Gust (estimate)', _each(columns, lambda hour: gust_cell(hour.launch_gust_kt(launch))))
     else:
@@ -363,8 +369,6 @@ def _wind_table(forecast, tz, name, path):
         table.row('Gust', _each(columns, lambda hour: gust_cell(hour.gust_kt)))
     table.gap(0.15)
     _hour_row(table, columns, tz)
-    if launch is not None:
-        table.overlays.append(_launch_rule(table, first_row, altitudes, launch))
 
     def top_of_lift(ax):
         # A rule across each column at that hour's top of lift, so the
@@ -386,9 +390,9 @@ def _wind_table(forecast, tz, name, path):
     footer = [f'Wind in {WIND_UNIT}; arrows point the way the air is moving.  '
               '\N{EM DASH} top of lift that hour.']
     if launch is not None:
-        footer.append(f'Altitudes are feet MSL. Launch row: the model\'s wind at launch height. Gust is '
-                      f'an estimate: while thermals reach launch, that wind scaled by the model\'s '
-                      f'gust-to-wind ratio at its ground ({_feet(surface, 10)} ft), up to 1.5x.')
+        footer.append(f'Altitudes are feet MSL. Launch row: the model\'s 10 m wind (its ground is '
+                      f'{_feet(surface, 10)} ft); rows above are the free air at that height. Gust is an '
+                      f'estimate from the free air at launch height and the model\'s gust-to-wind ratio.')
     else:
         footer.append('Altitudes are feet MSL. Surface is the model\'s terrain, with its 10 m wind.')
     footer += _gap_note(forecast, columns)

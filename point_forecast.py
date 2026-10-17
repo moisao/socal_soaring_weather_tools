@@ -597,9 +597,14 @@ class Hour:
         return float(self.profile['direction'].iloc[0]), float(self.profile['speed'].iloc[0])
 
     def launch_wind(self, launch_m):
-        """(direction deg, speed kt) at launch: the model's wind at the
-        launch's own height. The 10 m wind where launch is unknown or no
-        higher than the model's ground.
+        """(direction deg, speed kt) of the free air at launch height: the
+        model's wind at the launch's own elevation. The 10 m wind where
+        launch is unknown or no higher than the model's ground.
+
+        Feeds the gust estimate below. The wind table's launch row shows
+        the 10 m wind instead (see forecast_table._wind_table): against
+        the Little Black stations this free-air wind read high whenever a
+        model had a morning jet just above the hill.
 
         A 3 km grid flattens a ridge -- Little Black's cell sits at 176 m
         under a 357 m launch -- so the 10 m wind is a low, sheltered

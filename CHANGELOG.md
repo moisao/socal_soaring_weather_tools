@@ -203,6 +203,13 @@ itself out of the way:
   gust estimate's mean error over 8am–5pm was 7 mph, against 12 for the
   model's 10 m gust and 9 for xcskies'.
 
+- The launch row went back to the model's 10 m wind, with the free-air
+  rows starting above launch. Against the Holfuy and WeatherXM stations
+  at Little Black on 2026-10-16/17, the 10 m wind was closer in three
+  comparisons of four: the free air at launch height carried the models'
+  morning easterly jet (35–45 mph forecast, 14–19 measured).
+- Torrey Pines' launch: 350 ft.
+
 ## Also found along the way
 
 - 1000 mb is the highest isobaric level either model publishes; there is
