@@ -48,6 +48,7 @@ import os
 import re
 import threading
 import time
+from collections import namedtuple
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -118,12 +119,16 @@ def _release_freed_memory():
         pass
 
 
+# A named site. elevation_ft is the launch's own, MSL, or None if unknown.
+Site = namedtuple('Site', 'name lat lon elevation_ft aliases')
+
+
 def load_sites():
-    """Parse sites.tsv: one 'Name   lat   lon   [aliases]' per line, name
-    and the two floats separated by runs of whitespace (the name itself
-    may contain single spaces, e.g. "Little Black"), then optionally the
-    other names the site goes by, comma-separated ("lb"). Returns
-    (name, lat, lon, aliases) tuples."""
+    """Parse sites.tsv: one 'Name   lat   lon   [elevation]   [aliases]'
+    per line, name and the two floats separated by runs of whitespace
+    (the name itself may contain single spaces, e.g. "Little Black"),
+    then optionally the launch elevation in whole feet MSL, then the
+    other names the site goes by, comma-separated ("lb"). Returns Sites."""
     sites = []
     if not SITES_FILE.exists():
         return sites
@@ -132,10 +137,11 @@ def load_sites():
             line = line.rstrip('\n')
             if not line.strip():
                 continue
-            m = re.match(r'^(.*?)\s+(-?\d+\.\d+)\s+(-?\d+\.\d+)(?:\s+(.+?))?\s*$', line)
+            m = re.match(r'^(.*?)\s+(-?\d+\.\d+)\s+(-?\d+\.\d+)(?:\s+(\d+))?(?:\s+(.+?))?\s*$', line)
             if m:
-                aliases = tuple(a.strip() for a in (m.group(4) or '').split(',') if a.strip())
-                sites.append((m.group(1), float(m.group(2)), float(m.group(3)), aliases))
+                aliases = tuple(a.strip() for a in (m.group(5) or '').split(',') if a.strip())
+                elevation = int(m.group(4)) if m.group(4) else None
+                sites.append(Site(m.group(1), float(m.group(2)), float(m.group(3)), elevation, aliases))
     return sites
 
 
@@ -145,8 +151,8 @@ def sites_region(sites, margin=0.25):
     None without any sites."""
     if not sites:
         return None
-    lats = [lat for _, lat, _, _ in sites]
-    lons = [lon for _, _, lon, _ in sites]
+    lats = [site.lat for site in sites]
+    lons = [site.lon for site in sites]
     return (min(lats) - margin, max(lats) + margin, min(lons) - margin, max(lons) + margin)
 
 
@@ -157,14 +163,14 @@ def match_site(args):
     ['2026-09-17T19'] over for the datetime -- tried longest-first so a
     multi-word site name isn't cut short by a plausible-looking prefix
     match. A site's aliases match the same way as its name ("lb 14").
-    Returns ((name, lat, lon), remaining_args), or (None, args) if no
-    prefix of args names a known site."""
+    Returns (Site, remaining_args), or (None, args) if no prefix of args
+    names a known site."""
     sites = load_sites()
     for n in range(len(args), 0, -1):
         candidate = ' '.join(args[:n]).lower()
-        for name, lat, lon, aliases in sites:
-            if candidate in (name.lower(), *(alias.lower() for alias in aliases)):
-                return (name, lat, lon), args[n:]
+        for site in sites:
+            if candidate in (site.name.lower(), *(alias.lower() for alias in site.aliases)):
+                return site, args[n:]
     return None, args
 
 
@@ -302,7 +308,7 @@ async def sounding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # keeping any datetime that was given.
     match, remaining = match_site(args)
     if match is not None:
-        suggestion = ' '.join(['/site', match[0], *remaining])
+        suggestion = ' '.join(['/site', match.name, *remaining])
         metrics.current().done('bad_request', f'a site, not a station: {suggestion}')
         await update.message.reply_text(f'Command failed: Did you mean {suggestion}?')
         return
@@ -333,7 +339,7 @@ async def site(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             f'Unknown site {" ".join(args)!r}. See /sites for the list of names.')
         return
-    name, lat, lon = match
+    name, lat, lon = match.name, match.lat, match.lon
 
     # No time means this hour -- a forecast from the freshest run -- rather
     # than the freshest run's own analysis, which for RRFS (3-hourly, posted
@@ -349,7 +355,7 @@ async def site(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _render_and_reply(update, argv, timeout=600, label=name)
 
 
-def _render_point_forecast(name, lat, lon, day, models, progress):
+def _render_point_forecast(name, lat, lon, day, models, progress, launch_ft=None):
     """Blocking: fetch one day's point forecast and draw its tables.
     Returns (forecast, [thermals PNG, wind PNG]).
 
@@ -358,7 +364,9 @@ def _render_point_forecast(name, lat, lon, day, models, progress):
     only halve each other's bandwidth."""
     with _render_lock:
         try:
-            result = point_forecast.forecast(lat, lon, day, models=models, progress=progress)
+            result = point_forecast.forecast(
+                lat, lon, day, models=models, progress=progress,
+                launch_m=launch_ft / point_forecast.M_TO_FT if launch_ft else None)
         finally:
             _release_freed_memory()
         return result, forecast_table.render_tables(result, LOCAL_TZ, name=name,
@@ -381,7 +389,7 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(
             f'Unknown site {" ".join(args)!r}. See /sites for the list of names.')
         return
-    name, lat, lon = match
+    name, lat, lon = match.name, match.lat, match.lon
 
     # A model named anywhere after the site forces that one model; without
     # one it is point_forecast.DEFAULT_MODELS, RRFS and then HRRR.
@@ -432,7 +440,8 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     try:
         result, paths = await asyncio.wait_for(
-            asyncio.to_thread(_render_point_forecast, name, lat, lon, day, models, progress),
+            asyncio.to_thread(_render_point_forecast, name, lat, lon, day, models, progress,
+                              match.elevation_ft),
             1800)
     except asyncio.TimeoutError:
         command.done('timeout')
@@ -478,8 +487,8 @@ async def list_sites(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         metrics.current().done('unavailable', 'no sites.tsv')
         await update.message.reply_text('No named sites configured (sites.tsv not found or empty).')
         return
-    lines = [f'{name} ({", ".join(aliases)})' if aliases else name
-             for name, lat, lon, aliases in sites]
+    lines = [f'{site.name} ({", ".join(site.aliases)})' if site.aliases else site.name
+             for site in sites]
     await update.message.reply_text('Named sites:\n' + '\n'.join(lines))
 
 
@@ -517,7 +526,7 @@ def _prewarm_loop(hours):
         sites = load_sites()
         if sites and now.hour in hours:
             grib.set_region(sites_region(sites))
-            _, lat, lon, _ = sites[0]
+            lat, lon = sites[0].lat, sites[0].lon
             for ahead in (0, 1):
                 valid = now + timedelta(hours=ahead)
                 try:
@@ -555,7 +564,7 @@ def main() -> None:
     if not token:
         raise SystemExit('Set TELEGRAM_BOT_TOKEN in the environment first.')
 
-    metrics.initialise([name for name, _, _, _ in load_sites()], os.environ.get('METRICS_PORT'))
+    metrics.initialise([site.name for site in load_sites()], os.environ.get('METRICS_PORT'))
 
     # Set here as well as by the pre-warm, so a cold request's decode
     # leaves a region crop behind for the next site even with it off.

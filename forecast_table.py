@@ -258,7 +258,9 @@ def _thermal_table(forecast, tz, name, path):
     surface = hours[0].surface_m
     tops = [hour.top_m for hour in hours if hour.top_m is not None]
     top = max(tops + [surface + 1000 / M_TO_FT]) + ALTITUDE_STEP_FT / M_TO_FT
-    for feet in _altitudes(surface, top):
+    lift_altitudes = _altitudes(surface, top)
+    first_lift_row = len(table.rows)
+    for feet in lift_altitudes:
         metres = feet / M_TO_FT
         cells = []
         for _, hour in columns:
@@ -283,6 +285,9 @@ def _thermal_table(forecast, tz, name, path):
     table.row(f'ground {_feet(surface, 10)}', [None] * len(columns), label_color=MUTED)
     table.gap(0.15)
     _hour_row(table, columns, tz)
+    launch = _launch_above_ground(forecast)
+    if launch is not None:
+        table.overlays.append(_launch_rule(table, first_lift_row, lift_altitudes, launch))
 
     footer = ['Updraft is the air in a thermal core (w* with Lenschow\'s height profile); '
               'your climb is that less your sink rate.',
@@ -295,6 +300,30 @@ def _thermal_table(forecast, tz, name, path):
     footer += _gap_note(forecast, columns)
     title, subtitle = _titles(forecast, tz, name, 'thermals')
     table.draw(title, subtitle, footer, path)
+
+
+def _launch_above_ground(forecast):
+    """The launch elevation, if it is known and above the model's ground
+    -- below it, the model has no air at launch height to read."""
+    launch = forecast.launch_m
+    return launch if launch is not None and launch > forecast.hours[0].surface_m else None
+
+
+def _launch_rule(table, first_row, altitudes, launch_m):
+    """An overlay drawing a hairline across the grid at launch height,
+    labelled in the margin, so the rows above and below launch read
+    apart. Snapped to the gap between rows like the top-of-lift rule."""
+    def draw(ax):
+        feet = launch_m * M_TO_FT
+        if not altitudes[-1] <= feet <= altitudes[0]:
+            return
+        rows_above = np.ceil((altitudes[0] - feet) / ALTITUDE_STEP_FT)
+        y = table.origin_y + table.row_y(first_row) + rows_above * ROW_HEIGHT
+        x0, x1 = table.column_x(0), table.column_x(table.n_columns)
+        ax.plot([x0, x1], [y, y], color=SECONDARY, linewidth=1.2, solid_capstyle='butt')
+        ax.text(MARGIN, y, f'launch {_feet(launch_m, 10)}', fontsize=7, color=SECONDARY,
+                ha='left', va='center')
+    return draw
 
 
 def _wind_cell(direction, speed_kt):
@@ -317,14 +346,25 @@ def _wind_table(forecast, tz, name, path):
         label, color, major = _altitude_label(feet)
         table.row(label, cells, label_color=color, bold=major)
     table.gap(0.15)
-    table.row(f'Surface, {_feet(surface, 10)} ft',
-              _each(columns, lambda hour: _wind_cell(*hour.surface_wind)), label_color=INK, bold=True)
-    table.row('Gust', _each(columns, lambda hour: (
-        None if hour.gust_kt is None
-        else {'text': f'{hour.gust_kt * KT_TO_WIND:.0f}',
-              'fill': WIND_RAMP(min(hour.gust_kt / WIND_SCALE_KT, 1.))})))
+    launch = _launch_above_ground(forecast)
+
+    def gust_cell(gust_kt):
+        return None if gust_kt is None else {
+            'text': f'{gust_kt * KT_TO_WIND:.0f}', 'fill': WIND_RAMP(min(gust_kt / WIND_SCALE_KT, 1.))}
+
+    if launch is not None:
+        table.row(f'Launch, {_feet(launch, 10)} ft',
+                  _each(columns, lambda hour: _wind_cell(*hour.launch_wind(launch))),
+                  label_color=INK, bold=True)
+        table.row('Gust (estimate)', _each(columns, lambda hour: gust_cell(hour.launch_gust_kt(launch))))
+    else:
+        table.row(f'Surface, {_feet(surface, 10)} ft',
+                  _each(columns, lambda hour: _wind_cell(*hour.surface_wind)), label_color=INK, bold=True)
+        table.row('Gust', _each(columns, lambda hour: gust_cell(hour.gust_kt)))
     table.gap(0.15)
     _hour_row(table, columns, tz)
+    if launch is not None:
+        table.overlays.append(_launch_rule(table, first_row, altitudes, launch))
 
     def top_of_lift(ax):
         # A rule across each column at that hour's top of lift, so the
@@ -344,8 +384,13 @@ def _wind_table(forecast, tz, name, path):
 
     table.overlays.append(top_of_lift)
     footer = [f'Wind in {WIND_UNIT}; arrows point the way the air is moving.  '
-              '\N{EM DASH} top of lift that hour.',
-              'Altitudes are feet MSL. Surface is the model\'s terrain, with its 10 m wind.']
+              '\N{EM DASH} top of lift that hour.']
+    if launch is not None:
+        footer.append(f'Altitudes are feet MSL. Launch row: the model\'s wind at launch height. Gust is '
+                      f'an estimate: while thermals reach launch, that wind scaled by the model\'s '
+                      f'gust-to-wind ratio at its ground ({_feet(surface, 10)} ft), up to 1.5x.')
+    else:
+        footer.append('Altitudes are feet MSL. Surface is the model\'s terrain, with its 10 m wind.')
     footer += _gap_note(forecast, columns)
     title, subtitle = _titles(forecast, tz, name, 'wind')
     table.draw(title, subtitle, footer, path)

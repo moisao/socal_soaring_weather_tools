@@ -596,6 +596,48 @@ class Hour:
         """(direction deg, speed kt) at 10 m."""
         return float(self.profile['direction'].iloc[0]), float(self.profile['speed'].iloc[0])
 
+    def launch_wind(self, launch_m):
+        """(direction deg, speed kt) at launch: the model's wind at the
+        launch's own height. The 10 m wind where launch is unknown or no
+        higher than the model's ground.
+
+        A 3 km grid flattens a ridge -- Little Black's cell sits at 176 m
+        under a 357 m launch -- so the 10 m wind is a low, sheltered
+        slope's. The air at launch height is what a ridge or summit
+        actually sits in; checked on 2026-10-16 against the weather
+        station on Black Mountain's summit, it matched the afternoon's
+        sustained wind to within a few mph where the 10 m wind ran 5-8
+        mph under."""
+        if launch_m is None or launch_m <= self.profile['height'].iloc[0]:
+            return self.surface_wind
+        return self.wind_at(launch_m) or self.surface_wind
+
+    def launch_gust_kt(self, launch_m):
+        """Gust at launch, kt -- an estimate, never below the model's own
+        gust or the launch wind.
+
+        While thermals are mixing through launch height, the launch wind
+        scaled by the model's gust-to-wind ratio at its ground (held to
+        1-1.5). Otherwise the air at launch is the free flow above a
+        decoupled surface, and the model's surface ratio says nothing
+        about it, so no scaling: before this, a calm 3 mph 10 m wind
+        under a 30 mph morning jet came out as 90 mph gusts.
+
+        Checked on 2026-10-16 against the weather station on Black
+        Mountain's summit (~380 ft above Little Black's launch): mean
+        error 7 mph over 8am-5pm, against 12 for the model's 10 m gust
+        and 9 for xcskies'. One day at one site; the 1.5 cap is the knob."""
+        if self.gust_kt is None:
+            return None
+        _, launch_speed = self.launch_wind(launch_m)
+        gust = max(self.gust_kt, launch_speed)
+        mixing = launch_m is not None and self.top_m is not None and self.top_m > launch_m
+        if mixing:
+            _, surface_speed = self.surface_wind
+            ratio = min(max(self.gust_kt / max(surface_speed, 1.), 1.), 1.5)
+            gust = max(gust, launch_speed * ratio)
+        return gust
+
     def wind_at(self, height_m):
         """(direction deg, speed kt) at an MSL height, interpolated
         between levels by component; None below the ground or above the
@@ -736,13 +778,14 @@ class PointForecast:
     sunset: datetime
     top_level_m: float          # height of the highest level fetched, lowest over the day
     downloaded_bytes: int = 0
+    launch_m: float | None = None  # the site's own launch elevation, MSL, if known
 
     @property
     def runs(self):
         return sorted({hour.run for hour in self.hours})
 
 
-def forecast(lat, lon, day, models=None, progress=None):
+def forecast(lat, lon, day, models=None, progress=None, launch_m=None):
     """The point forecast for one local calendar day: an Hour for each
     hour the sun is up, from the first model in `models` (default
     DEFAULT_MODELS) with data for all of them -- or, if none has,
@@ -751,7 +794,9 @@ def forecast(lat, lon, day, models=None, progress=None):
     One model for the whole day rather than hour-by-hour fallback: a
     column from a different model is a discontinuity that reads as
     weather. progress, if given, is called with (hours done, hours total)
-    as the fetch goes."""
+    as the fetch goes. launch_m, the launch's real elevation, is carried
+    along for the tables (Hour.launch_wind); nothing fetched depends on
+    it."""
     valid_times = daylight_hours(lat, lon, day)
     if not valid_times:
         raise Unavailable(f'The sun does not rise and set at {lat:.2f}, {lon:.2f} on {day}')
@@ -837,7 +882,7 @@ def forecast(lat, lon, day, models=None, progress=None):
 
     return PointForecast(lat, lon, day, source, hours, sunrise, sunset,
                          top_level_m=min(hour.profile['height'].iloc[-1] for hour in hours),
-                         downloaded_bytes=downloaded)
+                         downloaded_bytes=downloaded, launch_m=launch_m)
 
 
 def parse_day(text, today):
@@ -874,6 +919,9 @@ def main(argv=None):
     parser.add_argument('--lat', type=float, required=True)
     parser.add_argument('--lon', type=float, required=True)
     parser.add_argument('--name', default=None, help='Label for the site, shown in the title')
+    parser.add_argument('--launch-ft', type=float, default=None,
+                        help='Launch elevation, ft MSL: the wind tables then show the wind and '
+                             'an estimated gust at launch height rather than the model\'s 10 m wind')
     parser.add_argument('--date', default='today',
                         help='Local day to forecast: a date, a day of the month, a weekday, '
                              '"today" or "tomorrow" (default: %(default)s)')
@@ -893,7 +941,8 @@ def main(argv=None):
         parser.error(f'Invalid date: {args.date!r} ({e})')
     try:
         result = forecast(args.lat, args.lon, day, models=[args.model] if args.model else None,
-                          progress=lambda done, total: print(f'\r{done}/{total}', end='', flush=True))
+                          progress=lambda done, total: print(f'\r{done}/{total}', end='', flush=True),
+                          launch_m=args.launch_ft / M_TO_FT if args.launch_ft else None)
     except Unavailable as e:
         raise SystemExit(str(e)) from None
     print(f'\n{result.source.label}, {result.downloaded_bytes / 1e6:.0f} MB downloaded')

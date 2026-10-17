@@ -262,8 +262,11 @@ replayed from `replay-index/` the way soundings are: a repeat re-reads the
 cached GRIB2, which takes seconds.
 
 Named sites come from `../sites.tsv`: one tab-separated `name`, `lat`,
-`lon` per line, and optionally a fourth column of other names the site
-goes by, comma-separated (`Little Black → lb`, `Torrey Pines → torrey`).
+`lon` per line, then optionally the launch elevation in whole feet MSL,
+then optionally the other names the site goes by, comma-separated
+(`Little Black → lb`, `Torrey Pines → torrey`). Elevations are the San
+Diego HG/PG Association site guide's where it lists one, otherwise the
+terrain at the site's coordinates; Torrey Pines has none yet.
 Aliases work everywhere a name does — `/site lb 14`, `/pf torrey sat` —
 and `/sites` lists them beside each name. The parser splits on `\s+` rather than on tabs
 specifically, so space-aligned lines still work — but a site name may
@@ -405,9 +408,12 @@ and on Linux, loading it alongside pyproj's copies crashes
 - **GFS can't pin a run or lead** — its "Best" series doesn't expose
   cycles.
 - **A point forecast's ground is the model's.** Altitudes are MSL, but the
-  surface row and the depth of lift start from the grid cell's terrain,
-  which a 3 km model smooths and a 0.25° one flattens: a ridge-top launch
-  can sit well above it.
+  depth of lift starts from the grid cell's terrain, which a 3 km model
+  smooths and a 0.25° one flattens: RRFS has nothing above 206 m within
+  6 km of Little Black, whose launch is at 357 m. With a launch elevation
+  in `sites.tsv` the wind table reads the model's wind at launch height
+  instead of its 10 m wind, and estimates the gust from it (see
+  `Hour.launch_gust_kt`); the tables mark launch with a rule.
 - **1000 mb is the floor**, so a sounding at a below-sea-level or
   very-high-pressure site has no isobaric level beneath that. The surface
   row now covers the bottom regardless.

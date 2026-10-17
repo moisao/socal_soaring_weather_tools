@@ -190,6 +190,19 @@ itself out of the way:
   ones, served on `METRICS_PORT`. Every label combination starts at zero
   so `increase()` sees the first request too.
 
+## Launch elevation
+
+- `sites.tsv` takes a launch elevation (ft MSL) after the coordinates.
+  With one, the wind table's bottom row is the model's wind at launch
+  height rather than its 10 m wind, and the gust is estimated from it;
+  both tables draw a rule at launch.
+- Why: RRFS's 3 km terrain tops out at 206 m within 6 km of Little Black
+  (launch 357 m, summit ~470 m), so its 10 m wind is a sheltered slope's.
+  On 2026-10-16 the Black Mountain summit station's afternoon wind was
+  14–20 mph; RRFS at launch height said 16–22, its 10 m wind 11–15. The
+  gust estimate's mean error over 8am–5pm was 7 mph, against 12 for the
+  model's 10 m gust and 9 for xcskies'.
+
 ## Also found along the way
 
 - 1000 mb is the highest isobaric level either model publishes; there is
