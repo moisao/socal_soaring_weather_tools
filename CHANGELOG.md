@@ -209,6 +209,9 @@ itself out of the way:
   comparisons of four: the free air at launch height carried the models'
   morning easterly jet (35–45 mph forecast, 14–19 measured).
 - Torrey Pines' launch: 350 ft.
+- The gust estimate uses the model's own 10 m gust unless thermals are
+  mixing through launch height; before, a morning jet just above the hill
+  read as 40+ mph launch gusts. RRFS gusts now track xcskies' within a few mph.
 
 ## Also found along the way
 

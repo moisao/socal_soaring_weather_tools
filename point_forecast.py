@@ -619,25 +619,21 @@ class Hour:
 
     def launch_gust_kt(self, launch_m):
         """Gust at launch, kt -- an estimate, never below the model's own
-        gust or the launch wind.
+        10 m gust.
 
-        While thermals are mixing through launch height, the launch wind
-        scaled by the model's gust-to-wind ratio at its ground (held to
-        1-1.5). Otherwise the air at launch is the free flow above a
-        decoupled surface, and the model's surface ratio says nothing
-        about it, so no scaling: before this, a calm 3 mph 10 m wind
-        under a 30 mph morning jet came out as 90 mph gusts.
-
-        Checked on 2026-10-16 against the weather station on Black
-        Mountain's summit (~380 ft above Little Black's launch): mean
-        error 7 mph over 8am-5pm, against 12 for the model's 10 m gust
-        and 9 for xcskies'. One day at one site; the 1.5 cap is the knob."""
+        While thermals are mixing through launch height, the free-air
+        launch wind scaled by the model's gust-to-wind ratio at its ground
+        (held to 1-1.5): the mixing is what brings that air down to launch.
+        Otherwise the model's 10 m gust as it is. The free air above a
+        decoupled surface is no guide then -- a morning jet just over the
+        hill would read as launch gusts of 40+ mph that neither the Little
+        Black stations nor xcskies' RRFS gusts showed (2026-10-17)."""
         if self.gust_kt is None:
             return None
-        _, launch_speed = self.launch_wind(launch_m)
-        gust = max(self.gust_kt, launch_speed)
+        gust = self.gust_kt
         mixing = launch_m is not None and self.top_m is not None and self.top_m > launch_m
         if mixing:
+            _, launch_speed = self.launch_wind(launch_m)
             _, surface_speed = self.surface_wind
             ratio = min(max(self.gust_kt / max(surface_speed, 1.), 1.), 1.5)
             gust = max(gust, launch_speed * ratio)
