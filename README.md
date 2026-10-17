@@ -296,8 +296,12 @@ few minutes of fetching and decoding in the background, after which a
 `/pf` for any site is answered in about a second. Today's tables come
 first, for every site, then tomorrow's; each site-day decodes its hours
 for all the sites in one pass (`point_forecast.prime`), so after the
-first, most take a second or two. A request arriving mid-pass waits
-behind at most one site-day.
+first, most take a second or two. The pass never starts a site-day
+while a request is in progress, so a `/pf` arriving mid-pass waits only
+for the one under way: seconds, or the first of a run's download
+(~1.5 min), which it would have waited on anyway. Point forecasts fetch
+under their own lock, so `/site` and `/sounding` wait only for a table
+being drawn (~1–2 s), never for a point-forecast download.
 
 No server offers these models cut to an area — NOMADS' grib filter has
 no RRFS and only 7 HRRR pressure levels — so every fetch is the whole

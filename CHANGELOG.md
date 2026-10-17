@@ -225,6 +225,12 @@ itself out of the way:
   sites. Drawing all 17 sites' two days cold took 532 s one site at a
   time and 262 s priming the rest from each one's pass; the tables come
   out byte-identical.
+- The pre-warm doesn't hold up requests: point forecasts fetch under a
+  lock of their own, taking the render lock only to draw, and the pass
+  waits for any request in progress before each site-day (a released
+  lock can be re-taken before a waiting thread wakes). Tested in the pod
+  with a cold pass under way: a `/pf` waited only for the download
+  already in progress, and the render lock was never held more than 1 s.
 
 ## Also found along the way
 

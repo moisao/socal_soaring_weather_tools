@@ -99,6 +99,42 @@ LOCAL_TZ = ZoneInfo(os.environ.get('SOUNDING_TIMEZONE') or 'America/Los_Angeles'
 # picking the newest matching PNG off disk (which two overlapping
 # requests for the same site could get wrong).
 _render_lock = threading.Lock()
+# Point forecasts' fetch and decode, which only ever race each other (on
+# the same cached hour files) -- not soundings, which use other files.
+# Only drawing their tables needs _render_lock too, so a /site or
+# /sounding waits out a point forecast's ~2 s of drawing, not its fetch.
+# Always taken before _render_lock, never while holding it.
+_point_forecast_lock = threading.Lock()
+
+
+class _Requests:
+    """How many requests are in progress, so the pre-warm can stand aside
+    for them. A lock alone doesn't do that: whoever releases it can take
+    it straight back before a waiting thread wakes, and the pre-warm
+    releasing and re-taking it site after site could keep a request
+    waiting through several."""
+
+    def __init__(self):
+        self._changed = threading.Condition()
+        self._active = 0
+
+    @contextlib.contextmanager
+    def active(self):
+        with self._changed:
+            self._active += 1
+        try:
+            yield
+        finally:
+            with self._changed:
+                self._active -= 1
+                self._changed.notify_all()
+
+    def wait_until_idle(self):
+        with self._changed:
+            self._changed.wait_for(lambda: self._active == 0)
+
+
+REQUESTS = _Requests()
 
 
 def _release_freed_memory():
@@ -208,7 +244,7 @@ def _render(argv: list) -> tuple:
     Runs on a worker thread (see _render_and_reply) because the whole
     fetch-and-plot is synchronous and slow enough -- seconds to minutes
     on a cold GRIB2 fetch -- to stall the bot's event loop otherwise."""
-    with _render_lock:
+    with REQUESTS.active(), _render_lock:
         # argparse reports bad input by printing to stderr and exiting,
         # so the actual complaint ("Invalid date/time: ...") is only
         # available by capturing that -- SystemExit itself carries just
@@ -375,12 +411,12 @@ def _point_forecast_tables(site, day, models, progress=None, prime_for=()):
     be asked for the same day, to decode this one's hours for in the same
     pass (point_forecast.prime).
 
-    Planned first, outside the render lock -- a few lookups at most --
-    so a day already drawn from its current runs comes straight back,
-    whatever else is running. Otherwise fetched and drawn under the lock:
-    nothing here touches pyplot, but two at once would race on the same
-    cached hour files, and two cold fetches only halve each other's
-    bandwidth anyway."""
+    Planned first, outside any lock -- a few lookups at most -- so a day
+    already drawn from its current runs comes straight back, whatever
+    else is running. Otherwise fetched under _point_forecast_lock (two at
+    once would race on the same cached hour files, and two cold fetches
+    only halve each other's bandwidth anyway) and drawn under
+    _render_lock as well, for matplotlib's global rcParams."""
     plan = point_forecast.plan_day(site.lat, site.lon, day, models)
     key = (site, day, plan.source.model)
 
@@ -392,7 +428,7 @@ def _point_forecast_tables(site, day, models, progress=None, prime_for=()):
 
     if (hit := drawn()) is not None:
         return hit
-    with _render_lock:
+    with _point_forecast_lock:
         # The pre-warm may have drawn it while this waited.
         if (hit := drawn()) is not None:
             return hit
@@ -405,13 +441,20 @@ def _point_forecast_tables(site, day, models, progress=None, prime_for=()):
         finally:
             _release_freed_memory()
         POINT_FORECAST_DIR.mkdir(parents=True, exist_ok=True)
-        paths = forecast_table.render_tables(result, LOCAL_TZ, name=site.name,
-                                             output_dir=POINT_FORECAST_DIR)
+        with _render_lock:
+            paths = forecast_table.render_tables(result, LOCAL_TZ, name=site.name,
+                                                 output_dir=POINT_FORECAST_DIR)
         today = datetime.now(LOCAL_TZ).date()
         for stale in [k for k in _drawn if k[1] < today]:
             del _drawn[stale]
         _drawn[key] = (plan, result, paths)
     return result, paths, False
+
+
+def _requested_point_forecast_tables(*args):
+    """_point_forecast_tables for a request, which the pre-warm waits for."""
+    with REQUESTS.active():
+        return _point_forecast_tables(*args)
 
 
 def _point_forecast_day(site, now):
@@ -486,7 +529,8 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     try:
         result, paths, drawn = await asyncio.wait_for(
-            asyncio.to_thread(_point_forecast_tables, match, day, models, progress), 1800)
+            asyncio.to_thread(_requested_point_forecast_tables, match, day, models, progress),
+            1800)
     except asyncio.TimeoutError:
         command.done('timeout')
         await update.message.reply_text('Timed out fetching that forecast.')
@@ -606,8 +650,10 @@ def _point_forecast_prewarm_loop(hours, days):
     lookups. Today first, for every site, then the day after: a run's
     files are the whole grid, so the first site of a day downloads and
     the rest mostly read what it decoded for them (prime_for). One
-    site-day at a time under the render lock, so a request waits behind
-    at most one of them."""
+    site-day at a time, and none started while a request is in progress
+    (REQUESTS), so a request waits behind at most the one under way --
+    seconds, or up to ~1.5 min for the first of a run, which is the
+    download any request for that run would have waited on anyway."""
     while True:
         now = datetime.now(LOCAL_TZ)
         if now.hour in hours:
@@ -615,6 +661,7 @@ def _point_forecast_prewarm_loop(hours, days):
             for ahead in range(days):
                 for site in sites:
                     day = _point_forecast_day(site, now) + timedelta(days=ahead)
+                    REQUESTS.wait_until_idle()
                     started = time.monotonic()
                     try:
                         result, _, drawn = _point_forecast_tables(site, day, None,
