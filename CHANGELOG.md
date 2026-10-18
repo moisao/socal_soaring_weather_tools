@@ -214,6 +214,8 @@ itself out of the way:
   row and the rule it drew at launch: rows of lift far below launch only
   pushed the useful part up, and with so many sites between 1,000 and
   2,000 ft the row under launch is the one to read.
+- The wind table went back to starting its free-air rows above launch: a
+  1,000 ft row just above the "Launch, 1,170 ft" row read as nonsense.
 - Launch is read at the model's ground wherever that is within 150 ft of
   it or nearer it than any row: the launch row is then the model's 10 m
   wind and its own gust, not an estimate from free air. On the current

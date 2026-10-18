@@ -441,9 +441,11 @@ and on Linux, loading it alongside pyproj's copies crashes
   6 km of Little Black, whose launch is at 357 m. With a launch elevation
   in `sites.tsv`, the wind table's launch row is the model's 10 m wind and
   the gust is estimated from the free air at launch height (see
-  `Hour.launch_gust_kt`). Both tables' rows start at the 250 ft row at or
-  below launch, as xcskies' do — 1,000 ft for Little Black's 1,170 — and
-  never at or below the model's ground. Where the model's ground is within
+  `Hour.launch_gust_kt`). The thermals table's rows start at the 250 ft
+  row at or below launch, as xcskies' do — 1,000 ft for Little Black's
+  1,170 — and the wind table's free-air rows at the first row above it
+  (1,250), so the launch row under them is the lowest altitude there.
+  Neither goes at or below the model's ground. Where the model's ground is within
   150 ft of launch, or nearer it than any row (Horse Canyon's 4,400 ft
   against RRFS's 4,530; an LZ at the foot of a range like Andy Jackson,
   1,700 ft against 2,330), launch is read at the model's ground: the

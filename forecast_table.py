@@ -241,11 +241,16 @@ def _free_air_launch(forecast):
     return launch
 
 
-def _altitudes(forecast, top_m):
+def _altitudes(forecast, top_m, above_launch=False):
     """Table rows up to top_m: feet MSL, highest first, on the round
-    ALTITUDE_STEP_FT, from _first_row_ft."""
+    ALTITUDE_STEP_FT, from _first_row_ft -- or, with above_launch, from
+    the first row above launch, for a table whose launch row goes
+    underneath them: a lower altitude just above the launch row reads
+    as nonsense."""
     launch = _free_air_launch(forecast)
     first = _first_row_ft(forecast, None if launch is None else launch * M_TO_FT)
+    if above_launch and launch is not None:
+        first = max(first, (np.floor(launch * M_TO_FT / ALTITUDE_STEP_FT) + 1) * ALTITUDE_STEP_FT)
     return np.arange(first, top_m * M_TO_FT + 1, ALTITUDE_STEP_FT)[::-1]
 
 
@@ -376,9 +381,9 @@ def _wind_table(forecast, tz, name, path):
     _hour_row(table, columns, tz)
     surface = forecast.hours[0].surface_m
     launch = _free_air_launch(forecast)
-    # With a launch elevation, the free-air rows start at the row at or
-    # below it; the launch row under them is the model's 10 m wind.
-    altitudes = _altitudes(forecast, _grid_top_m(forecast))
+    # With a launch elevation, the free-air rows start above it; the
+    # launch row under them is the model's 10 m wind.
+    altitudes = _altitudes(forecast, _grid_top_m(forecast), above_launch=True)
     first_row = len(table.rows)
     for feet in altitudes:
         cells = []
