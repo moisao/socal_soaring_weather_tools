@@ -236,6 +236,7 @@ cache is keyed by run, never by point, so it only grows with new runs.
 /site <name> [time]            e.g. /site Little Black            (this hour)
                                     /site Little Black 14         (2pm today)
                                     /site Little Black 2026-09-17T12
+/pf                            a menu: tap a site, then a day
 /pf <name> [day] [model]       e.g. /pf lb                          (today)
                                     /pf lb 17                       (the 17th)
                                     /pf torrey sat hrrr             (HRRR only)
@@ -253,7 +254,11 @@ model run. (It used to be that run's own analysis, which for RRFS —
 3-hourly, posted ~1.5 h late — can be up to ~4 h old.)
 
 `/pf` replies with the two [point forecast](#point-forecast) tables as
-an album. A model name (`rrfs`, `hrrr`, `gfs`) anywhere after the site
+an album. A bare `/pf` answers with a button for each site, then one for
+each of the next four days, and the tap on a day turns the menu into the
+forecast. Taps reach the bot in a group even with privacy mode on, where
+a typed `/pf` may need `@sdwxtestbot` after it. Menu requests are counted
+as `pf_menu`, the forecasts they lead to as `pf`. A model name (`rrfs`, `hrrr`, `gfs`) anywhere after the site
 uses that model alone; without one it's RRFS, then HRRR. A bare number is a **day of the month** here, not an
 hour — the tables already cover every daylight hour — and no day means
 today, or tomorrow once the sun has set. A cold day is several hundred MB

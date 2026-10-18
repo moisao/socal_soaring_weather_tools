@@ -26,7 +26,7 @@ logger = logging.getLogger('commands')
 # Outcomes a command can end in. Kept to these so each one's series can
 # be created up front (see initialise).
 OUTCOMES = ('ok', 'bad_request', 'unavailable', 'timeout', 'error')
-COMMANDS = ('sounding', 'site', 'pf', 'sites')
+COMMANDS = ('sounding', 'site', 'pf', 'pf_menu', 'sites')
 MODELS = ('rrfs', 'hrrr', 'gfs', 'observed')
 # Days from today, in the bot's zone. Bucketed so the label stays small.
 DAYS = ('past', '0', '1', '2', '3', '4', '5', '6', '7+')
@@ -124,13 +124,23 @@ def who(update):
     return f'{sender} in {chat.type} chat {chat.id}' if chat else sender
 
 
+def _text(update, context, name):
+    """The command as asked: what was typed, or for a tap on one of the
+    bot's menu buttons, the command and the button's data."""
+    if update.callback_query is not None:
+        return f'/{name} [menu] {update.callback_query.data}'
+    invoked = (update.message.text or '').split()[0] if update.message else f'/{name}'
+    return ' '.join([invoked, *(context.args or [])])
+
+
 def tracked(name):
-    """Decorator for a command handler: log it, time it, count it."""
+    """Decorator for a command handler: log it, time it, count it. The
+    handler may re-file itself under another name in COMMANDS by setting
+    current().name -- a bare /pf is the menu, not a forecast."""
     def decorate(handler):
         @functools.wraps(handler)
         async def wrapper(update, context):
-            invoked = (update.message.text or '').split()[0] if update.message else f'/{name}'
-            text = ' '.join([invoked, *(context.args or [])])
+            text = _text(update, context, name)
             command = Command(name, text)
             token = _current.set(command)
             logger.info('%s from %s', text, who(update))
@@ -143,11 +153,11 @@ def tracked(name):
             finally:
                 elapsed = time.monotonic() - started
                 outcome = command.outcome or 'ok'
-                COMMANDS_TOTAL.labels(name, outcome).inc()
-                RESPONSE_SECONDS.labels(name, outcome).observe(elapsed)
-                if outcome == 'ok':
+                COMMANDS_TOTAL.labels(command.name, outcome).inc()
+                RESPONSE_SECONDS.labels(command.name, outcome).observe(elapsed)
+                if outcome == 'ok' and command.name != 'pf_menu':
                     p = command.params
-                    REQUESTS_TOTAL.labels(name, p['site'], p['model'], p['day']).inc()
+                    REQUESTS_TOTAL.labels(command.name, p['site'], p['model'], p['day']).inc()
                 params = ', '.join(f'{k}={v}' for k, v in command.params.items() if v)
                 logger.info('%s -> %s in %.1fs%s%s', text, outcome, elapsed,
                             f' [{params}]' if params else '',

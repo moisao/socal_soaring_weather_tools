@@ -128,6 +128,10 @@ been split into modules.
   then HRRR — GFS only when named, being too coarse to trust by default.
 - Site aliases: an optional fourth column in `sites.tsv` (`lb`, `torrey`,
   …), matched like the name by every command.
+- A bare `/pf` opens a menu of inline buttons -- the sites, then the next
+  four days -- in place of the usage message; tapping a day turns the
+  menu into the forecast. Button taps reach the bot in groups whatever
+  its privacy mode.
 
 ## Faster cold renders
 

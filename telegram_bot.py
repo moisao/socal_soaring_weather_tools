@@ -50,15 +50,15 @@ import shutil
 import threading
 import time
 from collections import namedtuple
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from dateutil import parser as dateutil_parser
-from telegram import BotCommand, InputMediaPhoto, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram import ChatMember
-from telegram.ext import (Application, ChatMemberHandler, CommandHandler, ContextTypes,
-                          MessageHandler, filters)
+from telegram.ext import (Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler,
+                          ContextTypes, MessageHandler, filters)
 
 import forecast_table
 import grib
@@ -475,9 +475,14 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     args = context.args
     command = metrics.current()
     if not args:
-        command.done('bad_request', 'no site')
-        await update.message.reply_text(
-            'Usage: /pf <site> [day] [rrfs|hrrr|gfs]\nSee /sites for the list of names.')
+        sites = load_sites()
+        if not sites:
+            command.done('bad_request', 'no site')
+            await update.message.reply_text(
+                'Usage: /pf <site> [day] [rrfs|hrrr|gfs]\nNo named sites are configured.')
+            return
+        command.name = 'pf_menu'
+        await update.message.reply_text(PF_MENU_SITES, reply_markup=_site_keyboard(sites))
         return
 
     match, remaining = match_site(args)
@@ -486,7 +491,6 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(
             f'Unknown site {" ".join(args)!r}. See /sites for the list of names.')
         return
-    name = match.name
 
     # A model named anywhere after the site forces that one model; without
     # one it is point_forecast.DEFAULT_MODELS, RRFS and then HRRR.
@@ -510,9 +514,33 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     else:
         day = _point_forecast_day(match, now)
 
-    command.ask(site=name, day=metrics.day_label(day, now.date()))
-    label = f'{name} point forecast for {day:%a %b} {day.day}'
-    status = await update.message.reply_text(f'Fetching {label}...')
+    status = await update.message.reply_text(f'Fetching {_pf_label(match, day)}...')
+    await _send_point_forecast(status, match, day, models, reply_to=update.message,
+                               retry=f'/pf {" ".join(args)} gfs')
+
+
+def _pf_label(site, day):
+    return f'{site.name} point forecast for {day:%a %b} {day.day}'
+
+
+async def _send_point_forecast(status, site, day, models, reply_to, retry):
+    """Fetch and draw one site's day and send it, for a typed /pf or a
+    menu tap alike. status is the message showing progress, edited as
+    the fetch goes and deleted once the tables are sent. With reply_to
+    (a typed command) the tables and any failure are replies to it;
+    without (a menu tap), failures replace status and the tables go into
+    its chat. retry: the command for GFS, offered when RRFS and HRRR
+    can't answer."""
+    command = metrics.current()
+    now = datetime.now(LOCAL_TZ)
+    command.ask(site=site.name, day=metrics.day_label(day, now.date()))
+    label = _pf_label(site, day)
+
+    async def fail(text):
+        if reply_to is not None:
+            await reply_to.reply_text(text)
+        else:
+            await status.edit_text(text)
 
     # A cold day is a dozen hours of GRIB2 and takes minutes, so the
     # status message counts them off. Called from the worker thread;
@@ -532,11 +560,11 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     try:
         result, paths, drawn = await asyncio.wait_for(
-            asyncio.to_thread(_requested_point_forecast_tables, match, day, models, progress),
+            asyncio.to_thread(_requested_point_forecast_tables, site, day, models, progress),
             1800)
     except asyncio.TimeoutError:
         command.done('timeout')
-        await update.message.reply_text('Timed out fetching that forecast.')
+        await fail('Timed out fetching that forecast.')
         return
     except point_forecast.Unavailable as e:
         command.done('unavailable', str(e))
@@ -544,14 +572,13 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if models is None:
             # GFS is never a silent fallback (see DEFAULT_MODELS), so say
             # how to ask for it.
-            hint = (' RRFS goes out about 3.5 days and HRRR 2.'
-                    f'\nFor GFS anyway: /pf {" ".join(args)} gfs')
-        await update.message.reply_text(f'{e}{hint}')
+            hint = f' RRFS goes out about 3.5 days and HRRR 2.\nFor GFS anyway: {retry}'
+        await fail(f'{e}{hint}')
         return
     except Exception as e:
         logger.exception('Point forecast failed')
         command.done('error', f'{type(e).__name__}: {e}')
-        await update.message.reply_text(f'Failed: {type(e).__name__}: {e}')
+        await fail(f'Failed: {type(e).__name__}: {e}')
         return
 
     command.ask(model=result.source.model)
@@ -561,20 +588,103 @@ async def pointforecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                           f', {result.downloaded_bytes / 1e6:.0f} MB downloaded'))
 
     newest = result.runs[-1].astimezone(LOCAL_TZ)
-    caption = (f'{name}, {day:%a %b} {day.day} \N{EM DASH} {result.source.label}, '
+    caption = (f'{site.name}, {day:%a %b} {day.day} \N{EM DASH} {result.source.label}, '
                f'run {newest:%a %H:%M %Z}')
     media = [InputMediaPhoto(path.read_bytes(), caption=caption if i == 0 else None)
              for i, path in enumerate(paths)]
-    await update.message.reply_media_group(media)
+    if reply_to is not None:
+        await reply_to.reply_media_group(media)
+    else:
+        await status.get_bot().send_media_group(status.chat_id, media)
     # Into the archive with every other image sent (see POINT_FORECAST_DIR).
     for path in paths:
         with contextlib.suppress(OSError):
             if not (OUTPUT_DIR / path.name).exists():
                 shutil.copyfile(path, OUTPUT_DIR / path.name)
-    # The tables replace the progress counter, which would otherwise sit
-    # above them stopped short of 100%.
+    # The tables replace the progress counter (or the menu), which would
+    # otherwise sit above them stopped short of 100%.
     with contextlib.suppress(Exception):
         await status.delete()
+
+
+# The /pf menu: a bare /pf answers with a button per site, a site with a
+# button per day, and a day with the forecast, all in the one message.
+# Buttons rather than the Mini App the menu button can open: nothing to
+# host, and a tap on the bot's own message reaches it in a group even
+# with privacy mode on, which a typed /pf without @sdwxtestbot may not.
+# Button data is 'pf|sites', 'pf|site|<name>' or 'pf|day|<name>|<date>'
+# -- by name, not position, so a sites.tsv edit can't send a tap on an
+# old menu to the wrong site; Telegram allows 64 bytes of it.
+PF_MENU_SITES = 'Point forecast: which site?'
+PF_MENU_DAYS = 4        # the next daylight and three after: RRFS's reach
+
+
+def _site_keyboard(sites):
+    buttons = [InlineKeyboardButton(site.name, callback_data=f'pf|site|{site.name}')
+               for site in sites]
+    return InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)])
+
+
+def _day_keyboard(site, now):
+    first = _point_forecast_day(site, now)
+    today = now.date()
+
+    def label(day):
+        if day == today:
+            return 'Today'
+        if day == today + timedelta(days=1):
+            return 'Tomorrow'
+        return f'{day:%a} {day.day}'
+
+    days = [first + timedelta(days=n) for n in range(PF_MENU_DAYS)]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label(day), callback_data=f'pf|day|{site.name}|{day.isoformat()}')
+         for day in days],
+        [InlineKeyboardButton('\N{LEFTWARDS ARROW} Sites', callback_data='pf|sites')],
+    ])
+
+
+async def pf_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A tap on a /pf menu button. Moving between sites and days only
+    edits the menu; a day runs the forecast (pf_menu_forecast)."""
+    query = update.callback_query
+    parts = query.data.split('|')
+    sites = {site.name: site for site in load_sites()}
+    site = sites.get(parts[2]) if len(parts) > 2 else None
+    if parts[1] == 'sites':
+        await query.answer()
+        await query.edit_message_text(PF_MENU_SITES, reply_markup=_site_keyboard(sites.values()))
+    elif site is None:
+        await query.answer('That site is no longer in the list.', show_alert=True)
+        await query.edit_message_text(PF_MENU_SITES, reply_markup=_site_keyboard(sites.values()))
+    elif parts[1] == 'site':
+        await query.answer()
+        await query.edit_message_text(f'{site.name}: which day?',
+                                      reply_markup=_day_keyboard(site, datetime.now(LOCAL_TZ)))
+    elif parts[1] == 'day':
+        await pf_menu_forecast(update, context)
+
+
+@metrics.tracked('pf')
+async def pf_menu_forecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    _, _, name, iso = query.data.split('|')
+    site = next(site for site in load_sites() if site.name == name)
+    day = date.fromisoformat(iso)
+    now = datetime.now(LOCAL_TZ)
+    if day < _point_forecast_day(site, now):
+        # A menu left from an earlier day: offer today's days instead.
+        metrics.current().done('bad_request', 'day has passed')
+        await query.answer('That day has passed.')
+        await query.edit_message_text(f'{site.name}: which day?',
+                                      reply_markup=_day_keyboard(site, now))
+        return
+    await query.answer()
+    # The menu becomes the progress message, its buttons gone so a second
+    # tap can't ask again.
+    status = await query.edit_message_text(f'Fetching {_pf_label(site, day)}...')
+    await _send_point_forecast(status, site, day, None, reply_to=None,
+                               retry=f'/pf {site.name} {iso} gfs')
 
 
 @metrics.tracked('sites')
@@ -755,7 +865,7 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_commands([
         BotCommand('sounding', 'Observed radiosonde: /sounding [station] [local time]'),
         BotCommand('site', 'Modeled sounding at a site, now: /site <name> [local time]'),
-        BotCommand('pf', 'Point forecast, hourly lift/wind/cloud: /pf <site> [day] [model]'),
+        BotCommand('pf', 'Point forecast, hourly lift/wind/cloud: /pf for a menu, or /pf <site> [day] [model]'),
         BotCommand('sites', 'List named sites (from sites.tsv)'),
     ])
 
@@ -795,13 +905,14 @@ def main() -> None:
     app.add_handler(CommandHandler('site', site))
     app.add_handler(CommandHandler(['pf', 'pointforecast'], pointforecast))
     app.add_handler(CommandHandler('sites', list_sites))
+    app.add_handler(CallbackQueryHandler(pf_menu, pattern=r'^pf\|'))
     app.add_handler(ChatMemberHandler(membership, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, migrated))
     logger.info('Bot starting (polling)...')
     # Named rather than left to Telegram, which otherwise keeps whatever an
-    # earlier poller asked for: messages (commands, migrations) and the
-    # bot's own membership changes.
-    app.run_polling(allowed_updates=[Update.MESSAGE, Update.MY_CHAT_MEMBER])
+    # earlier poller asked for: messages (commands, migrations), taps on
+    # the /pf menu's buttons, and the bot's own membership changes.
+    app.run_polling(allowed_updates=[Update.MESSAGE, Update.CALLBACK_QUERY, Update.MY_CHAT_MEMBER])
 
 
 if __name__ == '__main__':
