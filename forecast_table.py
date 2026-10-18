@@ -198,22 +198,67 @@ def _gap_note(forecast, columns):
     return []
 
 
-def _altitudes(forecast, top_m):
-    """Table rows up to top_m: feet MSL, highest first, on the round
-    ALTITUDE_STEP_FT.
+# A launch this close to the model's ground is read at the ground: its
+# 10 m wind and gust are the model's own nearest to launch, where a row of
+# free air would be no closer.
+LAUNCH_AT_GROUND_WITHIN_FT = 150
 
-    From the row at or below launch, as xcskies does, so a launch between
-    rows (Little Black's 1,170) still has the row under it (1,000) -- with
-    so many sites at 1,000-2,000 ft, that row is where launch-height air
-    is read from. Never at or below the model's ground, though, where it
-    has no air: there, or with no launch known, from the first row above
-    the ground."""
+
+def _first_row_ft(forecast, launch_ft):
+    """The lowest row: the one at or below launch, as xcskies does, so a
+    launch between rows (Little Black's 1,170) still has the row under it
+    (1,000) -- with so many sites at 1,000-2,000 ft, that row is where
+    launch-height air is read from. Never at or below the model's ground,
+    though, where it has no air: there, or with no launch, the first row
+    above the ground."""
     step = ALTITUDE_STEP_FT
     first = (np.floor(forecast.hours[0].surface_m * M_TO_FT / step) + 1) * step
-    launch = _launch_above_ground(forecast)
-    if launch is not None:
-        first = max(first, np.floor(launch * M_TO_FT / step) * step)
-    return np.arange(first, top_m * M_TO_FT + 1, step)[::-1]
+    if launch_ft is not None:
+        first = max(first, np.floor(launch_ft / step) * step)
+    return first
+
+
+def _launch_at_ground(forecast):
+    """Whether launch is read at the model's ground rather than in its
+    free air: within LAUNCH_AT_GROUND_WITHIN_FT of the ground, or nearer
+    the ground than any row is -- Horse Canyon's 4,400 ft launch against
+    RRFS's ground at 4,530 and its first row at 4,750, or an LZ at the
+    foot of a range, where 3 km terrain is smoothed up over the slopes."""
+    if forecast.launch_m is None:
+        return False
+    launch_ft = forecast.launch_m * M_TO_FT
+    off_ground = abs(launch_ft - forecast.hours[0].surface_m * M_TO_FT)
+    return (off_ground <= LAUNCH_AT_GROUND_WITHIN_FT
+            or off_ground < abs(launch_ft - _first_row_ft(forecast, launch_ft)))
+
+
+def _free_air_launch(forecast):
+    """The launch elevation, m, where it is read in the model's free air
+    (above its ground and not _launch_at_ground), else None."""
+    launch = forecast.launch_m
+    if launch is None or launch <= forecast.hours[0].surface_m or _launch_at_ground(forecast):
+        return None
+    return launch
+
+
+def _altitudes(forecast, top_m):
+    """Table rows up to top_m: feet MSL, highest first, on the round
+    ALTITUDE_STEP_FT, from _first_row_ft."""
+    launch = _free_air_launch(forecast)
+    first = _first_row_ft(forecast, None if launch is None else launch * M_TO_FT)
+    return np.arange(first, top_m * M_TO_FT + 1, ALTITUDE_STEP_FT)[::-1]
+
+
+def _ground_note(forecast):
+    """A footer line for a launch read at the model's ground."""
+    if not _launch_at_ground(forecast):
+        return []
+    launch, ground = forecast.launch_m, forecast.hours[0].surface_m
+    note = f'Launch ({_feet(launch, 10)} ft) is read at the model\'s ground ({_feet(ground, 10)} ft)'
+    if abs(launch - ground) * M_TO_FT <= LAUNCH_AT_GROUND_WITHIN_FT:
+        return [f'{note}, within {LAUNCH_AT_GROUND_WITHIN_FT} ft of it.']
+    smoothed = '; its terrain is smoothed up over the slopes nearby' if ground > launch else ''
+    return [f'{note}, the nearest the model has to it{smoothed}.']
 
 
 def _altitude_label(feet):
@@ -266,9 +311,10 @@ def _thermal_table(forecast, tz, name, path):
 
     table.gap()
     surface = hours[0].surface_m
-    launch = _launch_above_ground(forecast)
+    launch = _free_air_launch(forecast)
     table.heading(f'Thermal updraft ({LIFT_UNIT}) by altitude (ft MSL)'
-                  + (f'  \N{MIDDLE DOT}  launch {_feet(launch, 10)} ft' if launch is not None else ''))
+                  + (f'  \N{MIDDLE DOT}  launch {_feet(forecast.launch_m, 10)} ft'
+                     if forecast.launch_m is not None else ''))
     # From launch up, like the wind table: lift far below launch is
     # nothing a pilot there can use, and rows of it only push the useful
     # part up.
@@ -310,32 +356,13 @@ def _thermal_table(forecast, tz, name, path):
               + (f'\N{MIDDLE DOT}  rows start at launch, or the row just below it; the model\'s '
                  f'ground is {_feet(surface, 10)} ft.'
                  if launch is not None else '\N{MIDDLE DOT}  ground is the model\'s terrain.')]
-    footer += _below_model_ground_note(forecast)
+    footer += _ground_note(forecast)
     if any(hour.wstar is None for hour in hours):
         footer.append('Grey cells: thermals reach here, but the model gave no heat flux to '
                       'size them with.')
     footer += _gap_note(forecast, columns)
     title, subtitle = _titles(forecast, tz, name, 'thermals')
     table.draw(title, subtitle, footer, path)
-
-
-def _below_model_ground_note(forecast):
-    """A footer line for a site below the model's ground -- an LZ at the
-    foot of a range, where 3 km terrain is smoothed up over the slopes --
-    whose tables start at the model's ground rather than the site's."""
-    surface = forecast.hours[0].surface_m
-    if forecast.launch_m is None or forecast.launch_m > surface:
-        return []
-    return [f'The model\'s ground here is {_feet(surface, 10)} ft, above the site\'s '
-            f'{_feet(forecast.launch_m, 10)} ft (its terrain is smoothed over the slopes '
-            f'nearby), so the tables start there.']
-
-
-def _launch_above_ground(forecast):
-    """The launch elevation, if it is known and above the model's ground
-    -- below it, the model has no air at launch height to read."""
-    launch = forecast.launch_m
-    return launch if launch is not None and launch > forecast.hours[0].surface_m else None
 
 
 def _wind_cell(direction, speed_kt):
@@ -348,7 +375,7 @@ def _wind_table(forecast, tz, name, path):
     table = _Table(len(columns))
     _hour_row(table, columns, tz)
     surface = forecast.hours[0].surface_m
-    launch = _launch_above_ground(forecast)
+    launch = _free_air_launch(forecast)
     # With a launch elevation, the free-air rows start at the row at or
     # below it; the launch row under them is the model's 10 m wind.
     altitudes = _altitudes(forecast, _grid_top_m(forecast))
@@ -375,6 +402,11 @@ def _wind_table(forecast, tz, name, path):
                   _each(columns, lambda hour: _wind_cell(*hour.surface_wind)),
                   label_color=INK, bold=True)
         table.row('Gust (estimate)', _each(columns, lambda hour: gust_cell(hour.launch_gust_kt(launch))))
+    elif _launch_at_ground(forecast):
+        table.row(f'Launch, {_feet(forecast.launch_m, 10)} ft',
+                  _each(columns, lambda hour: _wind_cell(*hour.surface_wind)),
+                  label_color=INK, bold=True)
+        table.row('Gust', _each(columns, lambda hour: gust_cell(hour.gust_kt)))
     else:
         table.row(f'Surface, {_feet(surface, 10)} ft',
                   _each(columns, lambda hour: _wind_cell(*hour.surface_wind)), label_color=INK, bold=True)
@@ -405,9 +437,12 @@ def _wind_table(forecast, tz, name, path):
         footer.append(f'Altitudes are feet MSL. Launch row: the model\'s 10 m wind (its ground is '
                       f'{_feet(surface, 10)} ft); rows above are the free air at that height. Gust is an '
                       f'estimate from the free air at launch height and the model\'s gust-to-wind ratio.')
+    elif _launch_at_ground(forecast):
+        footer.append('Altitudes are feet MSL. Launch row: the model\'s 10 m wind and gust; rows above '
+                      'are the free air at that height.')
     else:
         footer.append('Altitudes are feet MSL. Surface is the model\'s terrain, with its 10 m wind.')
-    footer += _below_model_ground_note(forecast)
+    footer += _ground_note(forecast)
     footer += _gap_note(forecast, columns)
     title, subtitle = _titles(forecast, tz, name, 'wind')
     table.draw(title, subtitle, footer, path)

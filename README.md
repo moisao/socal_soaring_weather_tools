@@ -443,9 +443,12 @@ and on Linux, loading it alongside pyproj's copies crashes
   the gust is estimated from the free air at launch height (see
   `Hour.launch_gust_kt`). Both tables' rows start at the 250 ft row at or
   below launch, as xcskies' do — 1,000 ft for Little Black's 1,170 — and
-  never at or below the model's ground. A site below the model's ground (an
-  LZ at the foot of a range: Andy Jackson is 1,700 ft, RRFS's ground there
-  2,330 ft) starts at the model's ground instead, and the footer says so.
+  never at or below the model's ground. Where the model's ground is within
+  150 ft of launch, or nearer it than any row (Horse Canyon's 4,400 ft
+  against RRFS's 4,530; an LZ at the foot of a range like Andy Jackson,
+  1,700 ft against 2,330), launch is read at the model's ground: the
+  launch row is its 10 m wind and gust, the rows start just above the
+  ground, and the footer says so.
 - **1000 mb is the floor**, so a sounding at a below-sea-level or
   very-high-pressure site has no isobaric level beneath that. The surface
   row now covers the bottom regardless.

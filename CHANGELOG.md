@@ -214,6 +214,11 @@ itself out of the way:
   row and the rule it drew at launch: rows of lift far below launch only
   pushed the useful part up, and with so many sites between 1,000 and
   2,000 ft the row under launch is the one to read.
+- Launch is read at the model's ground wherever that is within 150 ft of
+  it or nearer it than any row: the launch row is then the model's 10 m
+  wind and its own gust, not an estimate from free air. On the current
+  sites that is Whales and Horse Canyon (RRFS), Andy Jackson, and on
+  HRRR also Backshots, Soboba and Palomar.
   Where the site is below the model's ground (Andy Jackson, the Marshall
   LZ), both tables start at the model's ground and the footer says why.
 - The gust estimate uses the model's own 10 m gust unless thermals are
