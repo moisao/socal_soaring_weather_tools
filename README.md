@@ -151,8 +151,10 @@ One site, one local day, every hour the sun is up, as two tables of
 altitude (every 250 ft MSL) against hour — `PF_<MODEL>_<lat>_<lon>_<day>_run<run>_thermals.png`
 and `…_wind.png`:
 
-- **Thermals** — top of lift, cumulus base (or "blue"), the model's low /
-  middle / high cloud cover, and the expected updraft at each altitude.
+- **Thermals** — top of lift, cumulus base (or "blue") and top, rain at
+  the surface on days with any, the model's low / middle / high cloud
+  cover, and the expected updraft at each altitude, with each cumulus
+  shaded from base to top and drawn raining when it is.
 - **Wind** — direction and speed at each altitude, the surface wind and
   gust, with each hour's top of lift ruled across its column.
 
@@ -179,6 +181,18 @@ command) uses that one model alone, GFS included. Past f120 GFS is
 "Thermal tops" / "Cloud base" line): a parcel with the 2 m temperature and
 the mixed layer's mean moisture, followed up to where it meets the
 environment, or to its condensation level if that comes first.
+
+**Cumulus top** is that parcel followed on up from its base, moist, to
+where it is first no longer warmer than the air around it — the usual
+estimate of how tall the cloud can build (`point_forecast.cumulus_top`).
+A cloud still building at the top of what was fetched pulls the levels
+up to 500 mb (~18,000 ft), as a thermal reaching the top does; one still
+going there reads e.g. "19,350+". The grid shows the cloud up to 3,000 ft
+above the day's highest top of lift, with an arrow where it goes on.
+
+**Rain** is the model's precipitation rate at the surface that hour
+(`PRATE`), shown from 0.1 mm/h. HRRR and RRFS publish it instantaneous;
+GFS only as a mean, so a GFS day shows none.
 
 **Updraft** is the convective velocity scale `w* = (g/T · H/ρcp · zi)^⅓`
 — the model's surface sensible heat flux `H` mixed through the depth of

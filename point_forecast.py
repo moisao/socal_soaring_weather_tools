@@ -116,10 +116,14 @@ EXTEND_WITHIN_MB = 50
 
 SURFACE_LABELS = ('PRES:surface', 'TMP:2 m above ground', 'DPT:2 m above ground',
                   'UGRD:10 m above ground', 'VGRD:10 m above ground', 'GUST:surface',
-                  'SHTFL:surface', 'LCDC:low cloud layer', 'MCDC:middle cloud layer',
-                  'HCDC:high cloud layer')
+                  'SHTFL:surface', 'PRATE:surface', 'LCDC:low cloud layer',
+                  'MCDC:middle cloud layer', 'HCDC:high cloud layer')
 TERRAIN_LABEL = 'HGT:surface'
 FLUX_LABEL = 'SHTFL:surface'
+# Precipitation rate at the valid time, kg/m2/s (= mm/s). HRRR and RRFS
+# publish it instantaneous; GFS only as a mean, which _inventory leaves
+# out, so a GFS day shows no rain.
+RAIN_LABEL = 'PRATE:surface'
 
 FETCH_WORKERS = grib.HRRR_FETCH_WORKERS
 
@@ -549,6 +553,20 @@ def _profile(point, terrain_height):
     return df
 
 
+def _surface_parcel(profile):
+    """(p, T, parcel temperature, LCL pressure) for the surface parcel:
+    the 2 m temperature and the mixed layer's mean moisture, as
+    skewt.render_skewt_panel builds it."""
+    p = profile['pressure'].values * units.hPa
+    T = profile['temperature'].values * units.degC
+    moist = np.isfinite(profile['dewpoint'].values)
+    Td = profile['dewpoint'].values[moist] * units.degC
+    _, _, mixed_dewpoint = mpcalc.mixed_parcel(p[moist], T[moist], Td, depth=MIXED_LAYER_DEPTH)
+    parcel = mpcalc.parcel_profile(p, T[0], mixed_dewpoint).to('degC')
+    lcl_pressure, _ = mpcalc.lcl(p[0], T[0], mixed_dewpoint)
+    return p, T, parcel, lcl_pressure
+
+
 def thermal_top(profile):
     """(pressure hPa, is_cloud_base) of the top of the surface parcel's
     climb, or (None, None) where it has none -- capped below by an
@@ -559,14 +577,7 @@ def thermal_top(profile):
     tangled into the drawing: a parcel with the 2 m temperature and the
     mixed layer's mean moisture, followed up to where it first meets the
     environment, or to its condensation level if it gets there first."""
-    p = profile['pressure'].values * units.hPa
-    T = profile['temperature'].values * units.degC
-    moist = np.isfinite(profile['dewpoint'].values)
-    Td = profile['dewpoint'].values[moist] * units.degC
-    _, _, mixed_dewpoint = mpcalc.mixed_parcel(p[moist], T[moist], Td, depth=MIXED_LAYER_DEPTH)
-
-    parcel = mpcalc.parcel_profile(p, T[0], mixed_dewpoint).to('degC')
-    lcl_pressure, _ = mpcalc.lcl(p[0], T[0], mixed_dewpoint)
+    p, T, parcel, lcl_pressure = _surface_parcel(profile)
     cross_pressure, _ = mpcalc.find_intersections(p, parcel, T, direction='decreasing', log_x=True)
     top = cross_pressure[0].m if len(cross_pressure) > 0 else lcl_pressure.m
     top = max(top, lcl_pressure.m, p.m[-1])
@@ -576,6 +587,35 @@ def thermal_top(profile):
     if parcel_at_top < env_at_top - 0.05:
         return None, None
     return float(top), bool(np.isclose(top, lcl_pressure.m))
+
+
+def cumulus_top(profile):
+    """(pressure hPa, capped) of the top of the cumulus a thermal makes
+    at its condensation level: where the surface parcel, rising moist
+    above it, is first no longer warmer than the air around it -- the
+    usual estimate of how tall the cloud can build. A parcel no warmer
+    than the air just above its base makes a flat cloud, topped at the
+    base. capped: still warmer at the top of the profile, so the cloud
+    goes higher than the levels fetched say."""
+    p, T, parcel, lcl_pressure = _surface_parcel(profile)
+    lcl = lcl_pressure.m
+    above = p.m < lcl
+    excess_at_base = (np.interp(lcl, p.m[::-1], parcel.m[::-1])
+                      - np.interp(lcl, p.m[::-1], T.m[::-1]))
+    # From the base up: pressures and the parcel's excess warmth there.
+    levels = np.concatenate([[lcl], p.m[above]])
+    excess = np.concatenate([[excess_at_base], (parcel.m - T.m)[above]])
+    colder = np.nonzero(excess <= 0)[0]
+    if len(colder) == 0:
+        return float(levels[-1]), True
+    i = colder[0]
+    if i == 0:
+        return float(lcl), False
+    # The crossing, between the last level still warmer and the first not,
+    # in log pressure.
+    fraction = excess[i - 1] / (excess[i - 1] - excess[i])
+    top = np.exp(np.log(levels[i - 1]) + fraction * (np.log(levels[i]) - np.log(levels[i - 1])))
+    return float(top), False
 
 
 # Shape of a thermal's strength with height, from Lenschow & Stephens
@@ -599,6 +639,9 @@ class Hour:
     profile: pd.DataFrame = field(repr=False)
     top_m: float | None = None       # top of lift, MSL; None = no thermals
     cu_base_m: float | None = None   # cumulus base, MSL; None = blue (or no) thermals
+    cu_top_m: float | None = None    # how high that cumulus can build, MSL
+    cu_top_capped: bool = False      # higher than cu_top_m: the profile ends first
+    rain_mm_h: float | None = None   # precipitation at the surface; None = not published
     wstar: float | None = None       # m/s; None = the model gave no heat flux
     heat_flux: float | None = None   # W/m2, upward
     cloud: tuple = (None, None, None)  # low, middle, high cover, %
@@ -696,7 +739,8 @@ def _analyse(valid, run, lead, point, terrain_height, heat_flux):
     profile = _profile(point, terrain_height)
     hour = Hour(valid, run, lead, terrain_height, profile, heat_flux=heat_flux,
                 cloud=tuple(point.get(label) for label in SURFACE_LABELS[-3:]),
-                gust_kt=point['GUST:surface'] * MS_TO_KT if 'GUST:surface' in point else None)
+                gust_kt=point['GUST:surface'] * MS_TO_KT if 'GUST:surface' in point else None,
+                rain_mm_h=point[RAIN_LABEL] * 3600 if RAIN_LABEL in point else None)
 
     hour.top_pressure, is_cloud_base = thermal_top(profile)
     if hour.top_pressure is not None:
@@ -707,6 +751,9 @@ def _analyse(valid, run, lead, point, terrain_height, heat_flux):
         if top_m > terrain_height + 30:
             hour.top_m = top_m
             hour.cu_base_m = top_m if is_cloud_base else None
+            if is_cloud_base:
+                cu_top, hour.cu_top_capped = cumulus_top(profile)
+                hour.cu_top_m = max(float(pressure_to_km(cu_top)[0]) * 1000, top_m)
 
     if heat_flux is not None:
         hour.wstar = 0.
@@ -913,11 +960,12 @@ def forecast(lat, lon, day, models=None, progress=None, launch_m=None, plan=None
         top_mb = max(LEVEL_TOP_MB, min(surface_pressures) - INITIAL_DEPTH_MB)
         hours, fetched_top = analyse(top_mb)
         # A thermal that climbs to the top of what was fetched has only
-        # been measured against the levels that were there: pull the rest
-        # and work the day out again (the first pass's messages are
-        # already down).
+        # been measured against the levels that were there, and a cumulus
+        # still building there has no top yet: pull the rest and work the
+        # day out again (the first pass's messages are already down).
         if fetched_top > LEVEL_TOP_MB and any(
-                hour.top_pressure is not None and hour.top_pressure < fetched_top + EXTEND_WITHIN_MB
+                (hour.top_pressure is not None
+                 and hour.top_pressure < fetched_top + EXTEND_WITHIN_MB) or hour.cu_top_capped
                 for hour in hours):
             total += len(files)
             hours, _ = analyse(LEVEL_TOP_MB)

@@ -43,6 +43,16 @@ WIND_RAMP = LinearSegmentedColormap.from_list('wind', [
     '#fdf0e9', '#fad9c9', '#f4ad8c', '#ee8a5d', '#eb6834', '#cf5422', '#a94118', '#84310f',
     '#5f2209'])
 CLOUD_RAMP = LinearSegmentedColormap.from_list('cloud', [SURFACE, '#d6d5cf', '#a4a39c', '#75746f'])
+# Cumulus in the updraft grid: one grey, darker than the hairline grey of
+# lift without a strength so the two can't be confused.
+CUMULUS_FILL = '#c4c3bc'
+# Rain at the surface, by rate: blue-green, apart from lift's blue.
+RAIN_RAMP = LinearSegmentedColormap.from_list('rain', ['#d4ecea', '#8fcfc9', '#3fa69d', '#1f6f68'])
+RAIN_SCALE_MM_H = 5.0
+RAIN_MM_H = 0.1      # light rain: less than this isn't shown as rain
+# A cumulus taller than this above the day's highest top of lift goes
+# past the top of the grid, with an arrow; its top is in its own row.
+CUMULUS_ROWS_FT = 3000
 
 FONTS = {'font.family': ['Fira Sans', 'DejaVu Sans']}
 
@@ -154,7 +164,17 @@ class _Table:
                         arrowprops={'arrowstyle': '-|>', 'color': color, 'linewidth': 0.9,
                                     'mutation_scale': 6.5, 'shrinkA': 0, 'shrinkB': 0})
             text_x, align = x + CELL_WIDTH - 0.07, 'right'
-        if cell.get('text'):
+        if cell.get('rain'):
+            # A rain cloud, drawn: the fonts have a cloud but no rain cloud
+            # (U+1F327 and U+26C6 are in neither), so the cloud glyph,
+            # raised, with three slanted streaks of rain under it.
+            ax.text(x + CELL_WIDTH / 2, middle - 0.035, '\N{CLOUD}', fontsize=9, color=color,
+                    ha='center', va='center')
+            for dx in (-0.06, 0, 0.06):
+                streak_x = x + CELL_WIDTH / 2 + dx
+                ax.plot([streak_x + 0.012, streak_x - 0.012], [middle + 0.035, middle + 0.095],
+                        color=RAIN_RAMP(0.85), linewidth=1.1, solid_capstyle='round')
+        elif cell.get('text'):
             ax.text(text_x, middle, cell['text'], fontsize=cell.get('size', 8.5), color=color,
                     fontweight=cell.get('weight', 'normal'), ha=align, va='center')
 
@@ -309,6 +329,15 @@ def _thermal_table(forecast, tz, name, path):
     table.row('Cumulus base (ft)', _each(columns, lambda hour: (
         {'text': _feet(hour.cu_base_m)} if hour.cu_base_m is not None
         else {'text': 'blue', 'color': MUTED} if hour.top_m is not None else None)))
+    if any(hour.cu_base_m is not None for hour in hours):
+        table.row('Cumulus top (ft)', _each(columns, lambda hour: (
+            {'text': _feet(hour.cu_top_m) + ('+' if hour.cu_top_capped else '')}
+            if hour.cu_base_m is not None else None)))
+    if any(_raining(hour) for hour in hours):
+        table.row('Rain (mm/h)', _each(columns, lambda hour: (
+            {'text': f'{hour.rain_mm_h:.1f}',
+             'fill': RAIN_RAMP(min(hour.rain_mm_h / RAIN_SCALE_MM_H, 1.))}
+            if _raining(hour) else None)))
     for label, layer in (('High cloud (%)', 2), ('Mid cloud (%)', 1), ('Low cloud (%)', 0)):
         table.row(label, _each(columns, lambda hour, layer=layer: (
             None if hour.cloud[layer] is None
@@ -326,7 +355,13 @@ def _thermal_table(forecast, tz, name, path):
     bottom = launch if launch is not None else surface
     tops = [hour.top_m for hour in hours if hour.top_m is not None]
     top = max(tops + [bottom + 1000 / M_TO_FT]) + ALTITUDE_STEP_FT / M_TO_FT
+    # Up through the day's cumulus too, as far as CUMULUS_ROWS_FT above
+    # the highest top of lift.
+    cu_tops = [hour.cu_top_m for hour in hours if hour.cu_top_m is not None]
+    if cu_tops:
+        top = max(top, min(max(cu_tops), max(tops) + CUMULUS_ROWS_FT / M_TO_FT))
     lift_altitudes = _altitudes(forecast, top)
+    step_m = ALTITUDE_STEP_FT / M_TO_FT
     for feet in lift_altitudes:
         metres = feet / M_TO_FT
         cells = []
@@ -336,8 +371,20 @@ def _thermal_table(forecast, tz, name, path):
                 continue
             lift = hour.lift_at(metres)
             in_layer = hour.top_m is not None and metres < hour.top_m
-            if hour.cu_base_m is not None and 0 <= metres - hour.cu_base_m < ALTITUDE_STEP_FT / M_TO_FT:
-                cells.append({'text': '\N{CLOUD}', 'color': MUTED, 'size': 10})
+            if hour.cu_base_m is not None and 0 <= metres - hour.cu_base_m < step_m:
+                # The cloud's base: raining or not.
+                cells.append({'rain': True, 'fill': CUMULUS_FILL, 'color': SECONDARY}
+                             if _raining(hour) else
+                             {'text': '\N{CLOUD}', 'fill': CUMULUS_FILL, 'color': SECONDARY,
+                              'size': 10})
+            elif (hour.cu_base_m is not None and hour.cu_base_m < metres
+                  and metres < hour.cu_top_m + step_m / 2):
+                # Inside the cloud; the top row of the grid says when it
+                # goes on past it.
+                beyond = feet == lift_altitudes[0] and (hour.cu_top_capped
+                                                       or hour.cu_top_m > metres + step_m)
+                cells.append({'fill': CUMULUS_FILL, 'color': SECONDARY,
+                              'text': '\N{UPWARDS ARROW}' if beyond else None})
             elif lift is None:
                 # No heat flux from the model to size the thermals with:
                 # show where they reach, without a strength.
@@ -356,18 +403,25 @@ def _thermal_table(forecast, tz, name, path):
 
     footer = ['Updraft is the air in a thermal core (w* with Lenschow\'s height profile); '
               'your climb is that less your sink rate.',
-              'Top of lift and cumulus base are the surface parcel\'s, as on the sounding.  '
-              '\N{CLOUD} cumulus base  \N{MIDDLE DOT}  blue = thermals without cumulus  '
+              'Top of lift and cumulus base and top come from the surface parcel, as on the sounding.  '
+              '\N{CLOUD} cumulus base, grey to its top  \N{MIDDLE DOT}  blue = thermals without cumulus  '
               + (f'\N{MIDDLE DOT}  rows start at launch, or the row just below it; the model\'s '
                  f'ground is {_feet(surface, 10)} ft.'
                  if launch is not None else '\N{MIDDLE DOT}  ground is the model\'s terrain.')]
     footer += _ground_note(forecast)
+    if any(_raining(hour) for hour in hours):
+        footer.append(f'Rain: the model\'s rate at the surface that hour, from {RAIN_MM_H} mm/h; '
+                      f'at cumulus base, the cloud is drawn raining.')
     if any(hour.wstar is None for hour in hours):
         footer.append('Grey cells: thermals reach here, but the model gave no heat flux to '
                       'size them with.')
     footer += _gap_note(forecast, columns)
     title, subtitle = _titles(forecast, tz, name, 'thermals')
     table.draw(title, subtitle, footer, path)
+
+
+def _raining(hour):
+    return hour.rain_mm_h is not None and hour.rain_mm_h >= RAIN_MM_H
 
 
 def _wind_cell(direction, speed_kt):

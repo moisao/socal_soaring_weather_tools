@@ -128,6 +128,11 @@ been split into modules.
   then HRRR — GFS only when named, being too coarse to trust by default.
 - Site aliases: an optional fourth column in `sites.tsv` (`lb`, `torrey`,
   …), matched like the name by every command.
+- The thermals table shows how tall each cumulus can build (the surface
+  parcel followed moist from its base to its equilibrium level) and the
+  model's rain rate at the surface, shading each cloud from base to top
+  and drawing it raining (a cloud glyph with drawn streaks: the fonts
+  have no rain cloud) when the model has rain that hour.
 - A bare `/pf` opens a menu of inline buttons -- the sites, then the next
   four days -- in place of the usage message; tapping a day turns the
   menu into the forecast. Button taps reach the bot in groups whatever
