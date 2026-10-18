@@ -209,8 +209,11 @@ itself out of the way:
   comparisons of four: the free air at launch height carried the models'
   morning easterly jet (35–45 mph forecast, 14–19 measured).
 - Torrey Pines' launch: 350 ft.
-- The thermals table starts at launch as well, in place of the rule it
-  drew there: rows of lift below launch only pushed the useful part up.
+- Both tables start at the row at or below launch, as xcskies' do (1,000
+  ft for Little Black's 1,170), the thermals table in place of the ground
+  row and the rule it drew at launch: rows of lift far below launch only
+  pushed the useful part up, and with so many sites between 1,000 and
+  2,000 ft the row under launch is the one to read.
   Where the site is below the model's ground (Andy Jackson, the Marshall
   LZ), both tables start at the model's ground and the footer says why.
 - The gust estimate uses the model's own 10 m gust unless thermals are

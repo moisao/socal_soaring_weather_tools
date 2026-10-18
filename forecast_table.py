@@ -198,11 +198,22 @@ def _gap_note(forecast, columns):
     return []
 
 
-def _altitudes(bottom_m, top_m):
-    """Table rows from just above the ground to top_m: feet MSL, highest
-    first, on the round ALTITUDE_STEP_FT."""
-    first = (np.floor(bottom_m * M_TO_FT / ALTITUDE_STEP_FT) + 1) * ALTITUDE_STEP_FT
-    return np.arange(first, top_m * M_TO_FT + 1, ALTITUDE_STEP_FT)[::-1]
+def _altitudes(forecast, top_m):
+    """Table rows up to top_m: feet MSL, highest first, on the round
+    ALTITUDE_STEP_FT.
+
+    From the row at or below launch, as xcskies does, so a launch between
+    rows (Little Black's 1,170) still has the row under it (1,000) -- with
+    so many sites at 1,000-2,000 ft, that row is where launch-height air
+    is read from. Never at or below the model's ground, though, where it
+    has no air: there, or with no launch known, from the first row above
+    the ground."""
+    step = ALTITUDE_STEP_FT
+    first = (np.floor(forecast.hours[0].surface_m * M_TO_FT / step) + 1) * step
+    launch = _launch_above_ground(forecast)
+    if launch is not None:
+        first = max(first, np.floor(launch * M_TO_FT / step) * step)
+    return np.arange(first, top_m * M_TO_FT + 1, step)[::-1]
 
 
 def _altitude_label(feet):
@@ -254,15 +265,17 @@ def _thermal_table(forecast, tz, name, path):
             else {'text': f'{hour.cloud[layer]:.0f}', 'fill': CLOUD_RAMP(hour.cloud[layer] / 100)})))
 
     table.gap()
-    table.heading(f'Thermal updraft ({LIFT_UNIT}) by altitude (ft MSL)')
     surface = hours[0].surface_m
     launch = _launch_above_ground(forecast)
-    # From launch up, like the wind table: lift below launch is nothing a
-    # pilot there can use, and rows of it only push the useful part up.
+    table.heading(f'Thermal updraft ({LIFT_UNIT}) by altitude (ft MSL)'
+                  + (f'  \N{MIDDLE DOT}  launch {_feet(launch, 10)} ft' if launch is not None else ''))
+    # From launch up, like the wind table: lift far below launch is
+    # nothing a pilot there can use, and rows of it only push the useful
+    # part up.
     bottom = launch if launch is not None else surface
     tops = [hour.top_m for hour in hours if hour.top_m is not None]
     top = max(tops + [bottom + 1000 / M_TO_FT]) + ALTITUDE_STEP_FT / M_TO_FT
-    lift_altitudes = _altitudes(bottom, top)
+    lift_altitudes = _altitudes(forecast, top)
     for feet in lift_altitudes:
         metres = feet / M_TO_FT
         cells = []
@@ -285,9 +298,7 @@ def _thermal_table(forecast, tz, name, path):
                 cells.append(None)
         label, color, major = _altitude_label(feet)
         table.row(label, cells, label_color=color, bold=major)
-    if launch is not None:
-        table.row(f'launch {_feet(launch, 10)}', [None] * len(columns), label_color=INK, bold=True)
-    else:
+    if launch is None:
         table.row(f'ground {_feet(surface, 10)}', [None] * len(columns), label_color=MUTED)
     table.gap(0.15)
     _hour_row(table, columns, tz)
@@ -296,7 +307,8 @@ def _thermal_table(forecast, tz, name, path):
               'your climb is that less your sink rate.',
               'Top of lift and cumulus base are the surface parcel\'s, as on the sounding.  '
               '\N{CLOUD} cumulus base  \N{MIDDLE DOT}  blue = thermals without cumulus  '
-              + (f'\N{MIDDLE DOT}  rows start at launch; the model\'s ground is {_feet(surface, 10)} ft.'
+              + (f'\N{MIDDLE DOT}  rows start at launch, or the row just below it; the model\'s '
+                 f'ground is {_feet(surface, 10)} ft.'
                  if launch is not None else '\N{MIDDLE DOT}  ground is the model\'s terrain.')]
     footer += _below_model_ground_note(forecast)
     if any(hour.wstar is None for hour in hours):
@@ -337,9 +349,9 @@ def _wind_table(forecast, tz, name, path):
     _hour_row(table, columns, tz)
     surface = forecast.hours[0].surface_m
     launch = _launch_above_ground(forecast)
-    # With a launch elevation, the free-air rows start above it: the
-    # launch row below stands for everything from the ground up to launch.
-    altitudes = _altitudes(launch if launch is not None else surface, _grid_top_m(forecast))
+    # With a launch elevation, the free-air rows start at the row at or
+    # below it; the launch row under them is the model's 10 m wind.
+    altitudes = _altitudes(forecast, _grid_top_m(forecast))
     first_row = len(table.rows)
     for feet in altitudes:
         cells = []
