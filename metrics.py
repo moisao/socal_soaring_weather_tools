@@ -114,11 +114,14 @@ def current():
     return _current.get(None) or Command('', '')
 
 
-def _who(update):
+def who(update):
+    """Who sent it and where, by ID only -- 'user 42 in group chat -100...'.
+    IDs rather than usernames or group titles: they don't change, and
+    they say nothing about anyone to whoever reads the logs."""
     user = update.effective_user
     chat = update.effective_chat
-    who = f'@{user.username}' if user and user.username else f'user {user.id}' if user else '?'
-    return f'{who} (chat {chat.id})' if chat else who
+    sender = f'user {user.id}' if user else 'unknown user'
+    return f'{sender} in {chat.type} chat {chat.id}' if chat else sender
 
 
 def tracked(name):
@@ -130,7 +133,7 @@ def tracked(name):
             text = ' '.join([invoked, *(context.args or [])])
             command = Command(name, text)
             token = _current.set(command)
-            logger.info('%s from %s', text, _who(update))
+            logger.info('%s from %s', text, who(update))
             started = time.monotonic()
             try:
                 await handler(update, context)

@@ -56,7 +56,9 @@ from zoneinfo import ZoneInfo
 
 from dateutil import parser as dateutil_parser
 from telegram import BotCommand, InputMediaPhoto, Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import ChatMember
+from telegram.ext import (Application, ChatMemberHandler, CommandHandler, ContextTypes,
+                          MessageHandler, filters)
 
 import forecast_table
 import grib
@@ -713,6 +715,36 @@ def _sounding_prewarm_loop(stations):
         time.sleep(PREWARM_INTERVAL.total_seconds())
 
 
+# Membership changes, logged by ID (see metrics.who): with privacy mode on,
+# a group the bot was never in, or was removed from, looks exactly like
+# one whose commands it can't see, and nothing else would say which.
+chats_logger = logging.getLogger('chats')
+_PRESENT = {ChatMember.OWNER, ChatMember.ADMINISTRATOR, ChatMember.MEMBER, ChatMember.RESTRICTED}
+
+
+async def membership(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The bot added to, removed from, or changed in a chat."""
+    change = update.my_chat_member
+    old, new = change.old_chat_member.status, change.new_chat_member.status
+    if old not in _PRESENT and new in _PRESENT:
+        what = 'Added to'
+    elif old in _PRESENT and new not in _PRESENT:
+        what = 'Removed from'
+    else:
+        what = 'Membership changed in'
+    chats_logger.info('%s %s chat %s by user %s (%s -> %s)', what, change.chat.type,
+                      change.chat.id, change.from_user.id, old, new)
+
+
+async def migrated(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A group upgraded to a supergroup, which gives it a new ID. Telegram
+    posts this in both the old chat and the new; logged once, from the old."""
+    message = update.effective_message
+    if message.migrate_to_chat_id:
+        chats_logger.info('Group chat %s became supergroup chat %s', message.chat.id,
+                          message.migrate_to_chat_id)
+
+
 async def post_init(application: Application) -> None:
     # Registers the "/" autocomplete menu Telegram clients show while
     # typing -- without this the command still works, but no hint pops
@@ -763,8 +795,13 @@ def main() -> None:
     app.add_handler(CommandHandler('site', site))
     app.add_handler(CommandHandler(['pf', 'pointforecast'], pointforecast))
     app.add_handler(CommandHandler('sites', list_sites))
+    app.add_handler(ChatMemberHandler(membership, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, migrated))
     logger.info('Bot starting (polling)...')
-    app.run_polling()
+    # Named rather than left to Telegram, which otherwise keeps whatever an
+    # earlier poller asked for: messages (commands, migrations) and the
+    # bot's own membership changes.
+    app.run_polling(allowed_updates=[Update.MESSAGE, Update.MY_CHAT_MEMBER])
 
 
 if __name__ == '__main__':

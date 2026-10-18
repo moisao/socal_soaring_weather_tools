@@ -189,6 +189,10 @@ itself out of the way:
   command and outcome, plus the site, model and days ahead of successful
   ones, served on `METRICS_PORT`. Every label combination starts at zero
   so `increase()` sees the first request too.
+- Users and chats are logged by ID instead of username, and the bot logs
+  being added to or removed from a chat, and a group's upgrade to a
+  supergroup (a new ID): with privacy mode on, a group the bot isn't in
+  looks the same as one whose commands it can't see.
 
 ## Launch elevation
 

@@ -341,8 +341,16 @@ Every command is logged twice: as it arrives, and with its outcome and
 how long the reply took.
 
 ```
-2026-10-16 09:12:03 INFO commands: /pf lb 17 from @kevin (chat 42)
+2026-10-16 09:12:03 INFO commands: /pf lb 17 from user 42 in private chat 42
 2026-10-16 09:12:07 INFO commands: /pf lb 17 -> ok in 4.2s [site=Little Black, model=rrfs, day=1]: RRFS 3 km, runs 16 06Z, 0 MB downloaded
+```
+
+Users and chats are logged by ID, never by username or group title. The
+bot being added to or removed from a chat is logged too, as is a group
+becoming a supergroup (which changes its ID):
+
+```
+2026-10-18 12:30:00 INFO chats: Added to supergroup chat -1001234567890 by user 42 (left -> member)
 ```
 
 Outcomes are `ok`, `bad_request` (couldn't read the command),
