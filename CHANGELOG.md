@@ -231,6 +231,9 @@ itself out of the way:
   lock can be re-taken before a waiting thread wakes). Tested in the pod
   with a cold pass under way: a `/pf` waited only for the download
   already in progress, and the render lock was never held more than 1 s.
+- `OBSERVED_PREWARM` draws the newest launch of the stations it names as
+  soon as Wyoming posts it, so the first bare `/sounding` after a launch
+  is a replay.
 
 ## Also found along the way
 

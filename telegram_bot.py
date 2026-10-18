@@ -237,14 +237,15 @@ class BadArguments(Exception):
     """Arguments argparse refused, carrying its own complaint as text."""
 
 
-def _render(argv: list) -> tuple:
+def _render(argv: list, request=True) -> tuple:
     """Blocking: build arguments from argv, render, return the PNG path
-    and whether it was replayed rather than drawn.
+    and whether it was replayed rather than drawn. request=False for the
+    pre-warm, which isn't one (REQUESTS).
 
     Runs on a worker thread (see _render_and_reply) because the whole
     fetch-and-plot is synchronous and slow enough -- seconds to minutes
     on a cold GRIB2 fetch -- to stall the bot's event loop otherwise."""
-    with REQUESTS.active(), _render_lock:
+    with REQUESTS.active() if request else contextlib.nullcontext(), _render_lock:
         # argparse reports bad input by printing to stderr and exiting,
         # so the actual complaint ("Invalid date/time: ...") is only
         # available by capturing that -- SystemExit itself carries just
@@ -681,6 +682,37 @@ def _point_forecast_prewarm_loop(hours, days):
         time.sleep(PREWARM_INTERVAL.total_seconds())
 
 
+def _sounding_prewarm_loop(stations):
+    """Draw each station's newest launch as soon as the Wyoming archive
+    has it, so the first /sounding for it is a replay (~1 s) rather than
+    the archive lookups, the previous launch to compare with, the
+    Open-Meteo high and the plot (5-30 s).
+
+    Asks for exactly what a bare /sounding does (the latest synoptic
+    launch), so it lands under the same replay key. The archive is
+    checked outside the render lock -- load_sounding caches the CSV, so
+    once posted that's a file read -- and the render lock is taken only
+    once there is a launch to draw: twice a day, a few seconds each."""
+    while True:
+        launch = latest_synoptic_time()
+        for station in stations:
+            try:
+                wyoming.load_sounding(launch, station)
+            except (ValueError, wyoming.ArchiveUnavailable):
+                continue    # not posted yet, or the archive is failing: next time
+            REQUESTS.wait_until_idle()
+            started = time.monotonic()
+            try:
+                png, replayed = _render(['--station', station], request=False)
+            except Exception:
+                logger.exception('Pre-drawing the %s sounding failed', station)
+                continue
+            if not replayed:
+                logger.info('Pre-drew the %s sounding for %s in %.1fs', station,
+                            f'{launch:%Y-%m-%d %HZ}', time.monotonic() - started)
+        time.sleep(PREWARM_INTERVAL.total_seconds())
+
+
 async def post_init(application: Application) -> None:
     # Registers the "/" autocomplete menu Telegram clients show while
     # typing -- without this the command still works, but no hint pops
@@ -718,6 +750,13 @@ def main() -> None:
                          name='pf-prewarm', daemon=True).start()
         logger.info('Pre-drawing point forecasts %d day(s) ahead between %02d:00 and %02d:59',
                     pf_days, pf_hours[0], pf_hours[-1])
+
+    stations = [s.strip().upper() for s in (os.environ.get('OBSERVED_PREWARM') or '').split(',')
+                if s.strip()]
+    if stations:
+        threading.Thread(target=_sounding_prewarm_loop, args=(stations,),
+                         name='sounding-prewarm', daemon=True).start()
+        logger.info('Pre-drawing the newest launch from %s', ', '.join(stations))
 
     app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler('sounding', sounding))

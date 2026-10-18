@@ -303,6 +303,16 @@ for the one under way: seconds, or the first of a run's download
 under their own lock, so `/site` and `/sounding` wait only for a table
 being drawn (~1–2 s), never for a point-forecast download.
 
+`OBSERVED_PREWARM="NKX"` (comma-separated stations) draws each station's
+newest launch as soon as the Wyoming archive has it, so a bare
+`/sounding` replays it in under a second instead of taking 5–30 s. It
+checks every 5 minutes, outside the render lock, and draws twice a day.
+
+`/site`'s `SOUNDING_PREWARM` is left off in the deployment: each new hour
+needs a new lead (~280 MB of RRFS), it decodes whole grids outside the
+render lock (~2 GiB peak, so one overlapping a `/site` request can reach
+the pod's memory limit), and a warm `/site` saves only ~10–15 s.
+
 No server offers these models cut to an area — NOMADS' grib filter has
 no RRFS and only 7 HRRR pressure levels — so every fetch is the whole
 grid. What does get cut to an area is what's kept decoded: the bot crops
