@@ -442,7 +442,9 @@ and on Linux, loading it alongside pyproj's copies crashes
   in `sites.tsv`, the wind table's launch row is the model's 10 m wind and
   its free-air rows start above launch; the gust is estimated from the
   free air at launch height (see `Hour.launch_gust_kt`), and the thermals
-  table marks launch with a rule.
+  table's rows start at launch too. A site below the model's ground (an
+  LZ at the foot of a range: Andy Jackson is 1,700 ft, RRFS's ground there
+  2,330 ft) starts at the model's ground instead, and the footer says so.
 - **1000 mb is the floor**, so a sounding at a below-sea-level or
   very-high-pressure site has no isobaric level beneath that. The surface
   row now covers the bottom regardless.

@@ -256,10 +256,13 @@ def _thermal_table(forecast, tz, name, path):
     table.gap()
     table.heading(f'Thermal updraft ({LIFT_UNIT}) by altitude (ft MSL)')
     surface = hours[0].surface_m
+    launch = _launch_above_ground(forecast)
+    # From launch up, like the wind table: lift below launch is nothing a
+    # pilot there can use, and rows of it only push the useful part up.
+    bottom = launch if launch is not None else surface
     tops = [hour.top_m for hour in hours if hour.top_m is not None]
-    top = max(tops + [surface + 1000 / M_TO_FT]) + ALTITUDE_STEP_FT / M_TO_FT
-    lift_altitudes = _altitudes(surface, top)
-    first_lift_row = len(table.rows)
+    top = max(tops + [bottom + 1000 / M_TO_FT]) + ALTITUDE_STEP_FT / M_TO_FT
+    lift_altitudes = _altitudes(bottom, top)
     for feet in lift_altitudes:
         metres = feet / M_TO_FT
         cells = []
@@ -282,18 +285,20 @@ def _thermal_table(forecast, tz, name, path):
                 cells.append(None)
         label, color, major = _altitude_label(feet)
         table.row(label, cells, label_color=color, bold=major)
-    table.row(f'ground {_feet(surface, 10)}', [None] * len(columns), label_color=MUTED)
+    if launch is not None:
+        table.row(f'launch {_feet(launch, 10)}', [None] * len(columns), label_color=INK, bold=True)
+    else:
+        table.row(f'ground {_feet(surface, 10)}', [None] * len(columns), label_color=MUTED)
     table.gap(0.15)
     _hour_row(table, columns, tz)
-    launch = _launch_above_ground(forecast)
-    if launch is not None:
-        table.overlays.append(_launch_rule(table, first_lift_row, lift_altitudes, launch))
 
     footer = ['Updraft is the air in a thermal core (w* with Lenschow\'s height profile); '
               'your climb is that less your sink rate.',
               'Top of lift and cumulus base are the surface parcel\'s, as on the sounding.  '
               '\N{CLOUD} cumulus base  \N{MIDDLE DOT}  blue = thermals without cumulus  '
-              '\N{MIDDLE DOT}  ground is the model\'s terrain.']
+              + (f'\N{MIDDLE DOT}  rows start at launch; the model\'s ground is {_feet(surface, 10)} ft.'
+                 if launch is not None else '\N{MIDDLE DOT}  ground is the model\'s terrain.')]
+    footer += _below_model_ground_note(forecast)
     if any(hour.wstar is None for hour in hours):
         footer.append('Grey cells: thermals reach here, but the model gave no heat flux to '
                       'size them with.')
@@ -302,28 +307,23 @@ def _thermal_table(forecast, tz, name, path):
     table.draw(title, subtitle, footer, path)
 
 
+def _below_model_ground_note(forecast):
+    """A footer line for a site below the model's ground -- an LZ at the
+    foot of a range, where 3 km terrain is smoothed up over the slopes --
+    whose tables start at the model's ground rather than the site's."""
+    surface = forecast.hours[0].surface_m
+    if forecast.launch_m is None or forecast.launch_m > surface:
+        return []
+    return [f'The model\'s ground here is {_feet(surface, 10)} ft, above the site\'s '
+            f'{_feet(forecast.launch_m, 10)} ft (its terrain is smoothed over the slopes '
+            f'nearby), so the tables start there.']
+
+
 def _launch_above_ground(forecast):
     """The launch elevation, if it is known and above the model's ground
     -- below it, the model has no air at launch height to read."""
     launch = forecast.launch_m
     return launch if launch is not None and launch > forecast.hours[0].surface_m else None
-
-
-def _launch_rule(table, first_row, altitudes, launch_m):
-    """An overlay drawing a hairline across the grid at launch height,
-    labelled in the margin, so the rows above and below launch read
-    apart. Snapped to the gap between rows like the top-of-lift rule."""
-    def draw(ax):
-        feet = launch_m * M_TO_FT
-        if not altitudes[-1] <= feet <= altitudes[0]:
-            return
-        rows_above = np.ceil((altitudes[0] - feet) / ALTITUDE_STEP_FT)
-        y = table.origin_y + table.row_y(first_row) + rows_above * ROW_HEIGHT
-        x0, x1 = table.column_x(0), table.column_x(table.n_columns)
-        ax.plot([x0, x1], [y, y], color=SECONDARY, linewidth=1.2, solid_capstyle='butt')
-        ax.text(MARGIN, y, f'launch {_feet(launch_m, 10)}', fontsize=7, color=SECONDARY,
-                ha='left', va='center')
-    return draw
 
 
 def _wind_cell(direction, speed_kt):
@@ -395,6 +395,7 @@ def _wind_table(forecast, tz, name, path):
                       f'estimate from the free air at launch height and the model\'s gust-to-wind ratio.')
     else:
         footer.append('Altitudes are feet MSL. Surface is the model\'s terrain, with its 10 m wind.')
+    footer += _below_model_ground_note(forecast)
     footer += _gap_note(forecast, columns)
     title, subtitle = _titles(forecast, tz, name, 'wind')
     table.draw(title, subtitle, footer, path)
