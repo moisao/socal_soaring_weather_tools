@@ -676,7 +676,7 @@ SOUNDING_STATIONS = {'NKX': 'San Diego (Miramar)'}
 # Model buttons: the default chain first, under the name of the model it
 # starts with (RRFS, falling back to HRRR -- and for /site on to GFS --
 # where it doesn't reach), then each model alone.
-MENU_MODELS = (('rrfs', 'RRFS'), ('hrrr', 'HRRR only'), ('gfs', 'GFS only'))
+MENU_MODELS = (('rrfs', 'RRFS'), ('hrrr', 'HRRR'), ('gfs', 'GFS'))
 
 
 def _back(text, data):
