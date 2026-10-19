@@ -246,11 +246,15 @@ cache is keyed by run, never by point, so it only grows with new runs.
 ## Telegram bot
 
 ```
-/sounding [station] [time]     e.g. /sounding NKX 2026-09-17T17  (the 00Z launch)
-/site <name> [time]            e.g. /site Little Black            (this hour)
+/sounding                      a menu: tap a station, then a launch
+/sounding <station> [time]     e.g. /sounding NKX                (the latest launch)
+                                    /sounding NKX 2026-09-17T17  (the 00Z launch)
+/site                          a menu: tap a site, a time, then a model
+/site <name> [time] [model]    e.g. /site Little Black            (this hour)
                                     /site Little Black 14         (2pm today)
+                                    /site lb 14 hrrr              (HRRR only)
                                     /site Little Black 2026-09-17T12
-/pf                            a menu: tap a site, then a day
+/pf                            a menu: tap a site, a day, then a model
 /pf <name> [day] [model]       e.g. /pf lb                          (today)
                                     /pf lb 17                       (the 17th)
                                     /pf torrey sat hrrr             (HRRR only)
@@ -268,11 +272,25 @@ model run. (It used to be that run's own analysis, which for RRFS —
 3-hourly, posted ~1.5 h late — can be up to ~4 h old.)
 
 `/pf` replies with the two [point forecast](#point-forecast) tables as
-an album. A bare `/pf` answers with a button for each site, then one for
-each of the next four days, and the tap on a day turns the menu into the
-forecast. Taps reach the bot in a group even with privacy mode on, where
-a typed `/pf` may need `@sdwxtestbot` after it. Menu requests are counted
-as `pf_menu`, the forecasts they lead to as `pf`. A model name (`rrfs`, `hrrr`, `gfs`) anywhere after the site
+an album.
+
+A bare `/pf`, `/site` or `/sounding` opens a menu of buttons in one
+message, each tap moving it on to the next choice:
+
+- `/pf`: the site, then one of the next four days, then the model.
+- `/site`: the site, then now, an hour left in today's daylight or
+  tomorrow's 9am / 12pm / 3pm, then the model.
+- `/sounding`: the station, named with where it is ("NKX — San Diego
+  (Miramar)"), then the latest launch or one of the two before it.
+
+The model buttons are RRFS — the usual chain, which falls back to HRRR
+(and for `/site` on to GFS) where RRFS doesn't reach — then HRRR or GFS
+alone; HRRR is offered only within its 48 h. The last tap turns the menu
+into the "Fetching…" message, and the result follows in the same chat.
+Taps reach the bot in a group even with privacy mode on, where a typed
+command may need `@sdwxtestbot` after it. Opening a menu is counted as
+`pf_menu`, `site_menu` or `sounding_menu`; what it leads to as `pf`,
+`site` or `sounding`. A model name (`rrfs`, `hrrr`, `gfs`) anywhere after the site
 uses that model alone; without one it's RRFS, then HRRR. A bare number is a **day of the month** here, not an
 hour — the tables already cover every daylight hour — and no day means
 today, or tomorrow once the sun has set. A cold day is several hundred MB

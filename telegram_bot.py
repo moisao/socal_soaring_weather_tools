@@ -285,10 +285,32 @@ def _render(argv: list, request=True) -> tuple:
     return Path(f'{rendered.stub}.png'), False
 
 
-async def _render_and_reply(update: Update, argv: list, timeout: int, label: str) -> None:
+async def _render_and_reply(update: Update, argv: list, timeout: int, label: str,
+                            menu=None) -> None:
     """Shared plumbing for /sounding and /site: render in a worker
-    thread, then reply with the image or with whatever went wrong."""
-    await update.message.reply_text(f'Fetching {label} sounding...')
+    thread, then reply with the image or with whatever went wrong. menu:
+    the menu message a tap came from, which shows the progress and then
+    makes way for the image; without one (a typed command), everything
+    is a reply to the command."""
+    if menu is None:
+        await update.message.reply_text(f'Fetching {label} sounding...')
+
+        async def say(text):
+            await update.message.reply_text(text)
+
+        async def send(photo):
+            await update.message.reply_photo(photo)
+    else:
+        # Its buttons gone, so a second tap can't ask again.
+        status = await menu.edit_text(f'Fetching {label} sounding...')
+
+        async def say(text):
+            await status.edit_text(text)
+
+        async def send(photo):
+            await status.get_bot().send_photo(status.chat_id, photo)
+            with contextlib.suppress(Exception):
+                await status.delete()
 
     command = metrics.current()
     try:
@@ -298,11 +320,11 @@ async def _render_and_reply(update: Update, argv: list, timeout: int, label: str
         # cancelled, so it runs to completion and keeps the lock until
         # then. Further requests queue rather than failing.
         command.done('timeout')
-        await update.message.reply_text('Timed out fetching/plotting that sounding.')
+        await say('Timed out fetching/plotting that sounding.')
         return
     except BadArguments as e:
         command.done('bad_request', str(e))
-        await update.message.reply_text(f'Bad arguments: {e}')
+        await say(f'Bad arguments: {e}')
         return
     except Exception as e:
         # No data to be had -- an archive that's down, a launch or run
@@ -312,12 +334,12 @@ async def _render_and_reply(update: Update, argv: list, timeout: int, label: str
         if not unavailable:
             logger.exception('Sounding render failed')
         command.done('unavailable' if unavailable else 'error', f'{type(e).__name__}: {e}')
-        await update.message.reply_text(f'Failed: {type(e).__name__}: {e}')
+        await say(f'Failed: {type(e).__name__}: {e}')
         return
 
     if not png.exists():
         command.done('error', 'no image produced')
-        await update.message.reply_text('Ran, but no image was produced.')
+        await say('Ran, but no image was produced.')
         return
 
     # The model is the first part of a modeled render's name
@@ -326,7 +348,7 @@ async def _render_and_reply(update: Update, argv: list, timeout: int, label: str
     command.ask(model=prefix if prefix in point_forecast.SOURCES else 'observed')
     command.done('ok', f'{"replayed" if replayed else "rendered"} {png.name}')
     with open(png, 'rb') as photo:
-        await update.message.reply_photo(photo)
+        await send(photo)
 
 
 def _day_of(iso_text):
@@ -354,7 +376,11 @@ async def sounding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f'Command failed: Did you mean {suggestion}?')
         return
 
-    station = args[0] if len(args) >= 1 else 'NKX'
+    if not args:
+        metrics.current().name = 'sounding_menu'
+        await update.message.reply_text(SOUNDING_MENU_STATIONS, reply_markup=_station_keyboard())
+        return
+    station = args[0]
     argv = ['--station', station]
     day = metrics.day_label(latest_synoptic_time().astimezone(LOCAL_TZ), datetime.now(LOCAL_TZ).date())
     if len(args) >= 2:
@@ -369,9 +395,15 @@ async def sounding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def site(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
     if not args:
-        metrics.current().done('bad_request', 'no site')
-        await update.message.reply_text(
-            'Usage: /site <name> [datetime]\nSee /sites for the list of names.')
+        sites = load_sites()
+        if not sites:
+            metrics.current().done('bad_request', 'no site')
+            await update.message.reply_text(
+                'Usage: /site <name> [datetime] [rrfs|hrrr|gfs]\nNo named sites are configured.')
+            return
+        metrics.current().name = 'site_menu'
+        await update.message.reply_text(SITE_MENU_SITES,
+                                        reply_markup=_site_keyboard(sites, 'site'))
         return
 
     match, remaining = match_site(args)
@@ -380,20 +412,32 @@ async def site(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             f'Unknown site {" ".join(args)!r}. See /sites for the list of names.')
         return
-    name, lat, lon = match.name, match.lat, match.lon
+    # A model named anywhere after the site forces that one model, as for
+    # /pf; without one it is the sounding's own chain, RRFS -> HRRR -> GFS.
+    named = [word.lower() for word in remaining if word.lower() in point_forecast.SOURCES]
+    if len(named) > 1:
+        metrics.current().done('bad_request', 'more than one model')
+        await update.message.reply_text(f'Pick one model, not {" and ".join(named)}.')
+        return
+    remaining = [word for word in remaining if word.lower() not in point_forecast.SOURCES]
 
     # No time means this hour -- a forecast from the freshest run -- rather
     # than the freshest run's own analysis, which for RRFS (3-hourly, posted
     # ~1.5 h late) can be up to ~4 h old: 11am's at 2pm.
     when = chat_datetime(' '.join(remaining)) if remaining else datetime.now(LOCAL_TZ).isoformat()
-    argv = ['--lat', str(lat), '--lon', str(lon), '--name', name, '--datetime', when]
-    metrics.current().ask(site=name, day=_day_of(when))
+    argv = _site_argv(match, when, named[0] if named else None)
+    metrics.current().ask(site=match.name, day=_day_of(when))
 
     # A named site is a modeled (HRRR/RRFS/GFS) sounding, not the fast
     # Wyoming CSV archive /sounding uses -- a cold fetch (no cached GRIB2
     # run yet) can take several minutes, so this gets a much longer
     # timeout than /sounding's.
-    await _render_and_reply(update, argv, timeout=600, label=name)
+    await _render_and_reply(update, argv, timeout=600, label=match.name)
+
+
+def _site_argv(site, when, model=None):
+    argv = ['--lat', str(site.lat), '--lon', str(site.lon), '--name', site.name, '--datetime', when]
+    return argv + ['--model', model] if model else argv
 
 
 # Point forecasts already drawn, so a repeat -- or one the pre-warm got
@@ -607,69 +651,117 @@ async def _send_point_forecast(status, site, day, models, reply_to, retry):
         await status.delete()
 
 
-# The /pf menu: a bare /pf answers with a button per site, a site with a
-# button per day, and a day with the forecast, all in the one message.
-# Buttons rather than the Mini App the menu button can open: nothing to
-# host, and a tap on the bot's own message reaches it in a group even
-# with privacy mode on, which a typed /pf without @sdwxtestbot may not.
-# Button data is 'pf|sites', 'pf|site|<name>' or 'pf|day|<name>|<date>'
-# -- by name, not position, so a sites.tsv edit can't send a tap on an
-# old menu to the wrong site; Telegram allows 64 bytes of it.
+# Menus. A bare /pf, /site or /sounding answers with buttons, and each
+# tap edits the one message on to the next choice -- site, then day or
+# time, then model; or station, then launch -- until the last turns it
+# into the progress message and makes way for the result. Buttons rather
+# than the Mini App the menu button can open: nothing to host, and a tap
+# on the bot's own message reaches it in a group even with privacy mode
+# on, which a typed command without @sdwxtestbot may not.
+#
+# Button data is '<command>|<step>|<choices so far>' -- 'pf|day|Little
+# Black|2026-10-19', 'site|run|Torrey Pines|2026-10-19T14|hrrr' -- by name,
+# not position, so a sites.tsv edit can't send a tap on an old menu to the
+# wrong site; Telegram allows 64 bytes of it.
 PF_MENU_SITES = 'Point forecast: which site?'
+SITE_MENU_SITES = 'Modeled sounding: which site?'
+SOUNDING_MENU_STATIONS = 'Observed sounding (weather balloon): which station?'
 PF_MENU_DAYS = 4        # the next daylight and three after: RRFS's reach
+SITE_MENU_TOMORROW = (9, 12, 15)   # local hours offered for tomorrow
+SOUNDING_MENU_LAUNCHES = 3
+# Launch stations offered, with where they are: there's only the one near
+# the sites, and its name is what tells people what they're looking at.
+# A typed /sounding takes any station.
+SOUNDING_STATIONS = {'NKX': 'San Diego (Miramar)'}
+# Model buttons: the default chain first, under the name of the model it
+# starts with (RRFS, falling back to HRRR -- and for /site on to GFS --
+# where it doesn't reach), then each model alone.
+MENU_MODELS = (('rrfs', 'RRFS'), ('hrrr', 'HRRR only'), ('gfs', 'GFS only'))
 
 
-def _site_keyboard(sites):
-    buttons = [InlineKeyboardButton(site.name, callback_data=f'pf|site|{site.name}')
+def _back(text, data):
+    return [InlineKeyboardButton(f'\N{LEFTWARDS ARROW} {text}', callback_data=data)]
+
+
+def _site_keyboard(sites, command='pf'):
+    buttons = [InlineKeyboardButton(site.name, callback_data=f'{command}|site|{site.name}')
                for site in sites]
     return InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)])
 
 
+def _model_keyboard(prefix, first_valid, back):
+    """Model buttons for something first valid at first_valid: HRRR only
+    while it reaches that far (48 h), so a button can't promise what the
+    model doesn't have."""
+    ahead = (first_valid - datetime.now(LOCAL_TZ)).total_seconds() / 3600
+    buttons = [InlineKeyboardButton(label, callback_data=f'{prefix}|{model}')
+               for model, label in MENU_MODELS
+               if model != 'hrrr' or ahead <= point_forecast.SOURCES['hrrr'].max_lead]
+    return InlineKeyboardMarkup([buttons, back])
+
+
+def _day_label(day, today):
+    if day == today:
+        return 'Today'
+    if day == today + timedelta(days=1):
+        return 'Tomorrow'
+    return f'{day:%a} {day.day}'
+
+
 def _day_keyboard(site, now):
     first = _point_forecast_day(site, now)
-    today = now.date()
-
-    def label(day):
-        if day == today:
-            return 'Today'
-        if day == today + timedelta(days=1):
-            return 'Tomorrow'
-        return f'{day:%a} {day.day}'
-
     days = [first + timedelta(days=n) for n in range(PF_MENU_DAYS)]
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(label(day), callback_data=f'pf|day|{site.name}|{day.isoformat()}')
+        [InlineKeyboardButton(_day_label(day, now.date()),
+                              callback_data=f'pf|day|{site.name}|{day.isoformat()}')
          for day in days],
-        [InlineKeyboardButton('\N{LEFTWARDS ARROW} Sites', callback_data='pf|sites')],
+        _back('Sites', 'pf|sites'),
     ])
 
 
+def _pf_model_keyboard(site, day):
+    sun = point_forecast.sun_times(site.lat, site.lon, day)
+    first = sun[0] if sun is not None else datetime.combine(day, datetime.min.time(), LOCAL_TZ)
+    return _model_keyboard(f'pf|run|{site.name}|{day.isoformat()}', first,
+                           _back('Days', f'pf|site|{site.name}'))
+
+
+def _menu_site(query):
+    """The site a tap names, or None if there's none or it's gone from
+    sites.tsv since the menu was sent."""
+    parts = query.data.split('|')
+    return {site.name: site for site in load_sites()}.get(parts[2]) if len(parts) > 2 else None
+
+
 async def pf_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """A tap on a /pf menu button. Moving between sites and days only
-    edits the menu; a day runs the forecast (pf_menu_forecast)."""
+    """A tap on a /pf menu button. Moving between sites, days and models
+    only edits the menu; a model runs the forecast (pf_menu_forecast)."""
     query = update.callback_query
     parts = query.data.split('|')
-    sites = {site.name: site for site in load_sites()}
-    site = sites.get(parts[2]) if len(parts) > 2 else None
-    if parts[1] == 'sites':
-        await query.answer()
-        await query.edit_message_text(PF_MENU_SITES, reply_markup=_site_keyboard(sites.values()))
-    elif site is None:
-        await query.answer('That site is no longer in the list.', show_alert=True)
-        await query.edit_message_text(PF_MENU_SITES, reply_markup=_site_keyboard(sites.values()))
+    site = _menu_site(query)
+    if parts[1] == 'sites' or site is None:
+        await query.answer('That site is no longer in the list.' if parts[1] != 'sites' else None,
+                           show_alert=parts[1] != 'sites')
+        await query.edit_message_text(PF_MENU_SITES, reply_markup=_site_keyboard(load_sites()))
     elif parts[1] == 'site':
         await query.answer()
         await query.edit_message_text(f'{site.name}: which day?',
                                       reply_markup=_day_keyboard(site, datetime.now(LOCAL_TZ)))
     elif parts[1] == 'day':
+        day = date.fromisoformat(parts[3])
+        await query.answer()
+        await query.edit_message_text(
+            f'{site.name}, {day:%a %b} {day.day}: which model?',
+            reply_markup=_pf_model_keyboard(site, day))
+    elif parts[1] == 'run':
         await pf_menu_forecast(update, context)
 
 
 @metrics.tracked('pf')
 async def pf_menu_forecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    _, _, name, iso = query.data.split('|')
-    site = next(site for site in load_sites() if site.name == name)
+    _, _, name, iso, model = query.data.split('|')
+    site = _menu_site(query)
     day = date.fromisoformat(iso)
     now = datetime.now(LOCAL_TZ)
     if day < _point_forecast_day(site, now):
@@ -683,8 +775,140 @@ async def pf_menu_forecast(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # The menu becomes the progress message, its buttons gone so a second
     # tap can't ask again.
     status = await query.edit_message_text(f'Fetching {_pf_label(site, day)}...')
-    await _send_point_forecast(status, site, day, None, reply_to=None,
-                               retry=f'/pf {site.name} {iso} gfs')
+    await _send_point_forecast(status, site, day, None if model == 'rrfs' else [model],
+                               reply_to=None, retry=f'/pf {site.name} {iso} gfs')
+
+
+def _time_keyboard(site, now):
+    """/site times: now, every whole hour left in today's daylight, and a
+    few of tomorrow's, as 'YYYY-MM-DDTHH' in local time ('now' for now)."""
+    hour = now.replace(minute=0, second=0, microsecond=0)
+    sun = point_forecast.sun_times(site.lat, site.lon, now.date())
+    sunset = sun[1].astimezone(LOCAL_TZ) if sun is not None else hour.replace(hour=18)
+    today = []
+    later = hour + timedelta(hours=1)
+    while later <= sunset:
+        today.append(later)
+        later += timedelta(hours=1)
+    tomorrow = [(hour + timedelta(days=1)).replace(hour=h) for h in SITE_MENU_TOMORROW]
+
+    def button(text, when):
+        return InlineKeyboardButton(text, callback_data=f'site|time|{site.name}|{when}')
+
+    rows = [[button('Now', 'now')]]
+    hours = [button(_hour_label(t), f'{t:%Y-%m-%dT%H}') for t in today]
+    rows += [hours[i:i + 4] for i in range(0, len(hours), 4)]
+    rows.append([button(f'Tmrw {_hour_label(t)}', f'{t:%Y-%m-%dT%H}') for t in tomorrow])
+    rows.append(_back('Sites', 'site|sites'))
+    return InlineKeyboardMarkup(rows)
+
+
+def _hour_label(dt):
+    return f'{dt:%I}'.lstrip('0') + f'{dt:%p}'.lower()
+
+
+def _menu_time(text):
+    """A /site menu time: now, or the local hour 'YYYY-MM-DDTHH'."""
+    if text == 'now':
+        return datetime.now(LOCAL_TZ)
+    return datetime.strptime(text, '%Y-%m-%dT%H').replace(tzinfo=LOCAL_TZ)
+
+
+async def site_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A tap on a /site menu button: sites, then a time, then a model,
+    which renders the sounding (site_menu_render)."""
+    query = update.callback_query
+    parts = query.data.split('|')
+    site = _menu_site(query)
+    if parts[1] == 'sites' or site is None:
+        await query.answer('That site is no longer in the list.' if parts[1] != 'sites' else None,
+                           show_alert=parts[1] != 'sites')
+        await query.edit_message_text(SITE_MENU_SITES,
+                                      reply_markup=_site_keyboard(load_sites(), 'site'))
+    elif parts[1] == 'site':
+        await query.answer()
+        await query.edit_message_text(f'{site.name}: what time?',
+                                      reply_markup=_time_keyboard(site, datetime.now(LOCAL_TZ)))
+    elif parts[1] == 'time':
+        when = _menu_time(parts[3])
+        await query.answer()
+        await query.edit_message_text(
+            f'{site.name}, ' + ('now' if parts[3] == 'now' else
+                                f'{when:%a} {_hour_label(when)}') + ': which model?',
+            reply_markup=_model_keyboard(f'site|run|{site.name}|{parts[3]}', when,
+                                         _back('Times', f'site|site|{site.name}')))
+    elif parts[1] == 'run':
+        await site_menu_render(update, context)
+
+
+@metrics.tracked('site')
+async def site_menu_render(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    _, _, _, when, model = query.data.split('|')
+    site = _menu_site(query)
+    when = _menu_time(when).isoformat()
+    metrics.current().ask(site=site.name, day=_day_of(when))
+    await query.answer()
+    await _render_and_reply(update, _site_argv(site, when, None if model == 'rrfs' else model),
+                            timeout=600, label=site.name, menu=query.message)
+
+
+def _station_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f'{station} \N{EM DASH} {where}', callback_data=f'snd|stn|{station}')]
+        for station, where in SOUNDING_STATIONS.items()])
+
+
+def _launch_keyboard(station):
+    """The latest launch -- what a bare /sounding used to draw, and what
+    the pre-warm draws (OBSERVED_PREWARM) -- and the ones before it."""
+    latest = latest_synoptic_time()
+    launches = [latest - timedelta(hours=12 * n) for n in range(1, SOUNDING_MENU_LAUNCHES)]
+
+    def label(launch):
+        local = launch.astimezone(LOCAL_TZ)
+        return f'{local:%a} {_hour_label(local)} ({launch:%H}Z)'
+
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f'Latest: {label(latest)}', callback_data=f'snd|run|{station}|latest')],
+        [InlineKeyboardButton(label(launch), callback_data=f'snd|run|{station}|{launch:%Y%m%d%H}')
+         for launch in launches],
+        _back('Stations', 'snd|stns'),
+    ])
+
+
+async def sounding_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A tap on a /sounding menu button: a station, then a launch."""
+    query = update.callback_query
+    parts = query.data.split('|')
+    if parts[1] == 'stns':
+        await query.answer()
+        await query.edit_message_text(SOUNDING_MENU_STATIONS, reply_markup=_station_keyboard())
+    elif parts[1] == 'stn':
+        await query.answer()
+        where = SOUNDING_STATIONS.get(parts[2], parts[2])
+        await query.edit_message_text(f'{parts[2]} \N{EM DASH} {where}: which launch?',
+                                      reply_markup=_launch_keyboard(parts[2]))
+    elif parts[1] == 'run':
+        await sounding_menu_render(update, context)
+
+
+@metrics.tracked('sounding')
+async def sounding_menu_render(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    _, _, station, launch = query.data.split('|')
+    argv = ['--station', station]
+    when = latest_synoptic_time()
+    if launch != 'latest':
+        # Exactly what a bare /sounding asks for when it's the latest, so
+        # the render the pre-warm left under that replay key is the one
+        # sent; an earlier launch is pinned.
+        when = datetime.strptime(launch, '%Y%m%d%H').replace(tzinfo=ZoneInfo('UTC'))
+        argv += ['--datetime', when.isoformat()]
+    metrics.current().ask(site=metrics.station_label(station),
+                          day=metrics.day_label(when.astimezone(LOCAL_TZ), datetime.now(LOCAL_TZ).date()))
+    await query.answer()
+    await _render_and_reply(update, argv, timeout=120, label=station, menu=query.message)
 
 
 @metrics.tracked('sites')
@@ -863,8 +1087,8 @@ async def post_init(application: Application) -> None:
     # commands there may need "@YourBotUsername" if another bot in the
     # same group also defines the same command name).
     await application.bot.set_my_commands([
-        BotCommand('sounding', 'Observed radiosonde: /sounding [station] [local time]'),
-        BotCommand('site', 'Modeled sounding at a site, now: /site <name> [local time]'),
+        BotCommand('sounding', 'Observed radiosonde: /sounding for a menu, or /sounding <station> [local time]'),
+        BotCommand('site', 'Modeled sounding at a site: /site for a menu, or /site <name> [local time] [model]'),
         BotCommand('pf', 'Point forecast, hourly lift/wind/cloud: /pf for a menu, or /pf <site> [day] [model]'),
         BotCommand('sites', 'List named sites (from sites.tsv)'),
     ])
@@ -906,6 +1130,8 @@ def main() -> None:
     app.add_handler(CommandHandler(['pf', 'pointforecast'], pointforecast))
     app.add_handler(CommandHandler('sites', list_sites))
     app.add_handler(CallbackQueryHandler(pf_menu, pattern=r'^pf\|'))
+    app.add_handler(CallbackQueryHandler(site_menu, pattern=r'^site\|'))
+    app.add_handler(CallbackQueryHandler(sounding_menu, pattern=r'^snd\|'))
     app.add_handler(ChatMemberHandler(membership, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, migrated))
     logger.info('Bot starting (polling)...')

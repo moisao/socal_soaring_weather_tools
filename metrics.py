@@ -26,7 +26,7 @@ logger = logging.getLogger('commands')
 # Outcomes a command can end in. Kept to these so each one's series can
 # be created up front (see initialise).
 OUTCOMES = ('ok', 'bad_request', 'unavailable', 'timeout', 'error')
-COMMANDS = ('sounding', 'site', 'pf', 'pf_menu', 'sites')
+COMMANDS = ('sounding', 'sounding_menu', 'site', 'site_menu', 'pf', 'pf_menu', 'sites')
 MODELS = ('rrfs', 'hrrr', 'gfs', 'observed')
 # Days from today, in the bot's zone. Bucketed so the label stays small.
 DAYS = ('past', '0', '1', '2', '3', '4', '5', '6', '7+')
@@ -155,7 +155,7 @@ def tracked(name):
                 outcome = command.outcome or 'ok'
                 COMMANDS_TOTAL.labels(command.name, outcome).inc()
                 RESPONSE_SECONDS.labels(command.name, outcome).observe(elapsed)
-                if outcome == 'ok' and command.name != 'pf_menu':
+                if outcome == 'ok' and not command.name.endswith('_menu'):
                     p = command.params
                     REQUESTS_TOTAL.labels(command.name, p['site'], p['model'], p['day']).inc()
                 params = ', '.join(f'{k}={v}' for k, v in command.params.items() if v)

@@ -137,6 +137,11 @@ been split into modules.
   four days -- in place of the usage message; tapping a day turns the
   menu into the forecast. Button taps reach the bot in groups whatever
   its privacy mode.
+- Menus for `/site` (site, time, model) and `/sounding` (station, shown
+  with where it is, then launch), and a model step for `/pf`'s. A bare
+  `/sounding` is now its menu; the latest launch is still one tap away
+  and replayed from the pre-warm. A typed `/site` takes a model name, as
+  `/pf` does.
 
 ## Faster cold renders
 
