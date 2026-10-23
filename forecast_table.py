@@ -49,7 +49,7 @@ CUMULUS_FILL = '#c4c3bc'
 # Rain at the surface, by rate: blue-green, apart from lift's blue.
 RAIN_RAMP = LinearSegmentedColormap.from_list('rain', ['#d4ecea', '#8fcfc9', '#3fa69d', '#1f6f68'])
 RAIN_SCALE_MM_H = 5.0
-RAIN_MM_H = 0.1      # light rain: less than this isn't shown as rain
+RAIN_MM_H = 0.1      # mm in the hour: less than this isn't shown as rain
 # A cumulus taller than this above the day's highest top of lift goes
 # past the top of the grid, with an arrow; its top is in its own row.
 CUMULUS_ROWS_FT = 3000
@@ -409,8 +409,11 @@ def _thermal_table(forecast, tz, name, path):
                  f'ground is {_feet(surface, 10)} ft.'
                  if launch is not None else '\N{MIDDLE DOT}  ground is the model\'s terrain.')]
     footer += _ground_note(forecast)
+    if any(hour.cu_base_m is not None for hour in hours):
+        footer.append('Cumulus top: the surface parcel rising on from its base, mixing in the air '
+                      'around it as it goes, until it is no warmer than that air or has evaporated.')
     if any(_raining(hour) for hour in hours):
-        footer.append(f'Rain: the model\'s rate at the surface that hour, from {RAIN_MM_H} mm/h; '
+        footer.append(f'Rain: the model\'s total for the hour ending then, from {RAIN_MM_H} mm; '
                       f'at cumulus base, the cloud is drawn raining.')
     if any(hour.wstar is None for hour in hours):
         footer.append('Grey cells: thermals reach here, but the model gave no heat flux to '

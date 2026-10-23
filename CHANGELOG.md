@@ -137,6 +137,14 @@ been split into modules.
   four days -- in place of the usage message; tapping a day turns the
   menu into the forecast. Button taps reach the bot in groups whatever
   its privacy mode.
+- Cumulus tops mix in the air around the cloud as it climbs (0.5 /km)
+  instead of the unmixed equilibrium level, which on 2026-10-22 read
+  18,500+ ft at Little Black at five hours where the airports reported
+  no towering cumulus and the 5pm NKX sounding's moist layer ended at
+  7,700 ft. Cumulus days now fetch the humidity at every level for it.
+  Tops that day: 9,750-12,000 ft. Rain is each hour's total instead of
+  the instantaneous rate, which had a passing model shower read as
+  25 mm/h.
 - Menus for `/site` (site, time, model) and `/sounding` (station, shown
   with where it is, then launch), and a model step for `/pf`'s. A bare
   `/sounding` is now its menu; the latest launch is still one tap away

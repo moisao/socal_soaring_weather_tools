@@ -182,17 +182,26 @@ command) uses that one model alone, GFS included. Past f120 GFS is
 the mixed layer's mean moisture, followed up to where it meets the
 environment, or to its condensation level if that comes first.
 
-**Cumulus top** is that parcel followed on up from its base, moist, to
-where it is first no longer warmer than the air around it — the usual
-estimate of how tall the cloud can build (`point_forecast.cumulus_top`).
-A cloud still building at the top of what was fetched pulls the levels
-up to 500 mb (~18,000 ft), as a thermal reaching the top does; one still
-going there reads e.g. "19,350+". The grid shows the cloud up to 3,000 ft
-above the day's highest top of lift, with an arrow where it goes on.
+**Cumulus top** is that parcel followed on up from its base, saturated,
+mixing in 0.5 of its mass per km climbed from the air around it, to where
+it is no longer warmer than that air or has evaporated
+(`point_forecast.cumulus_top`, `CUMULUS_ENTRAINMENT_PER_KM`). Unmixed, the
+top would be the equilibrium level — how tall the instability lets a
+cloud get, not how tall it does: on 2026-10-22 that read 18,500+ ft at
+Little Black where no cloud grew past ~10,000, the air above being
+10–30 % humidity. The rate was chosen against that day's NKX sounding
+and airport reports and a real storm (see the constant's comment). A
+cumulus day fetches the humidity at every level up to 500 mb (~18,000
+ft) for it; a cloud still building there reads e.g. "19,350+". The grid
+shows the cloud up to 3,000 ft above the day's highest top of lift, with
+an arrow where it goes on.
 
-**Rain** is the model's precipitation rate at the surface that hour
-(`PRATE`), shown from 0.1 mm/h. HRRR and RRFS publish it instantaneous;
-GFS only as a mean, so a GFS day shows none.
+**Rain** is the model's total for the hour ending at each column
+(`APCP`), shown from 0.1 mm. The hour's total rather than the rate at
+the hour (`PRATE`, at first): an instantaneous rate is one grid cell at
+one moment, and read 25 mm/h at Little Black on 2026-10-22 where the
+hour's total was 1.6 mm. GFS only totals since its 6-hourly reset, so a
+GFS day shows none.
 
 **Updraft** is the convective velocity scale `w* = (g/T · H/ρcp · zi)^⅓`
 — the model's surface sensible heat flux `H` mixed through the depth of

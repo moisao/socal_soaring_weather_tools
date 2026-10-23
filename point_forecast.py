@@ -116,14 +116,19 @@ EXTEND_WITHIN_MB = 50
 
 SURFACE_LABELS = ('PRES:surface', 'TMP:2 m above ground', 'DPT:2 m above ground',
                   'UGRD:10 m above ground', 'VGRD:10 m above ground', 'GUST:surface',
-                  'SHTFL:surface', 'PRATE:surface', 'LCDC:low cloud layer',
+                  'SHTFL:surface', 'APCP:surface', 'LCDC:low cloud layer',
                   'MCDC:middle cloud layer', 'HCDC:high cloud layer')
 TERRAIN_LABEL = 'HGT:surface'
 FLUX_LABEL = 'SHTFL:surface'
-# Precipitation rate at the valid time, kg/m2/s (= mm/s). HRRR and RRFS
-# publish it instantaneous; GFS only as a mean, which _inventory leaves
-# out, so a GFS day shows no rain.
-RAIN_LABEL = 'PRATE:surface'
+# Precipitation over the hour ending at the valid time, kg/m2 (= mm).
+# The hour's total rather than the rate at the valid time (PRATE, as this
+# first was): an instantaneous rate is one grid cell at one moment, and a
+# model shower crossing it at the top of the hour read as a 25 mm/h
+# downpour at Little Black on 2026-10-22, where only a trace fell, hours
+# earlier. HRRR and RRFS publish each hour's total; GFS only totals since
+# its last 6-hourly reset, which _inventory leaves out, so a GFS day
+# shows no rain.
+RAIN_LABEL = 'APCP:surface'
 
 FETCH_WORKERS = grib.HRRR_FETCH_WORKERS
 
@@ -263,7 +268,8 @@ def _inventory(source, run, lead, product):
     Only instantaneous fields, which is what every label here means --
     the same variable and level also turn up as hourly maxima and
     averages -- except GFS's sensible heat flux, which exists only as an
-    average (see _instantaneous_flux)."""
+    average (see _instantaneous_flux), and precipitation, the total over
+    the hour to this lead (RAIN_LABEL)."""
     df = _herbie(source, run, lead, product).inventory()
     rows = {}
     for row in df.itertuples():
@@ -271,7 +277,11 @@ def _inventory(source, run, lead, product):
         instantaneous = re.fullmatch(r'anl|\d+ hour fcst', row.forecast_time) is not None
         averaged_flux = (source.flux_averaged and label == FLUX_LABEL
                          and re.fullmatch(r'\d+-\d+ hour ave fcst', row.forecast_time))
-        if (instantaneous or averaged_flux) and label not in rows:
+        hourly_total = (label == RAIN_LABEL
+                        and row.forecast_time == f'{lead - 1}-{lead} hour acc fcst')
+        if label == RAIN_LABEL:
+            instantaneous = False
+        if (instantaneous or averaged_flux or hourly_total) and label not in rows:
             rows[label] = row
     return rows
 
@@ -483,7 +493,7 @@ def _level_labels(levels, humidity_levels):
     return labels | {f'RH:{level} mb' for level in humidity_levels}
 
 
-def _wanted_levels(available, surface_pressures, top_mb):
+def _wanted_levels(available, surface_pressures, top_mb, all_humidity=False):
     """(levels, humidity_levels) to fetch, from the isobaric levels a
     model publishes and the day's range of surface pressure.
 
@@ -491,11 +501,14 @@ def _wanted_levels(available, surface_pressures, top_mb):
     dropped from the profile anyway. Humidity only as deep as the parcel
     needs it -- the mixed layer its moisture is averaged over (see
     skewt.MIXED_LAYER_DEPTH), to the first level beyond so the layer's
-    top can be interpolated. RH rather than the dewpoint a sounding
-    fetches: same information, half the bytes on HRRR and a third on
-    RRFS."""
+    top can be interpolated -- unless all_humidity, for a day with
+    cumulus, whose tops depend on the air they grow into (cumulus_top).
+    RH rather than the dewpoint a sounding fetches: same information,
+    half the bytes on HRRR and a third on RRFS."""
     levels = sorted((lvl for lvl in available if top_mb <= lvl < max(surface_pressures)),
                     reverse=True)
+    if all_humidity:
+        return levels, levels
     mixed_top = min(surface_pressures) - MIXED_LAYER_DEPTH.m
     humidity = [lvl for lvl in levels if lvl > mixed_top]
     humidity += [lvl for lvl in levels if lvl <= mixed_top][:1]
@@ -589,33 +602,111 @@ def thermal_top(profile):
     return float(top), bool(np.isclose(top, lcl_pressure.m))
 
 
-def cumulus_top(profile):
+# How fast a growing cumulus mixes in the air around it: the fraction of
+# its mass replaced per km it climbs (see cumulus_top). Chosen against
+# 2026-10-22-23, where 0.5 put the observed NKX 00Z sounding's tops at
+# 7,700 ft, where its moist layer ended (unmixed: 9,100), and RRFS's
+# Little Black tops at 10-12,000 ft, under the airports' highest decks
+# (BKN090-100) with no towering cumulus reported (unmixed: 15,900-18,600+),
+# while keeping the deep convection over the Sierra Madre on 2026-10-18
+# at 17-18,000 ft an hour before its 97 mm/h of rain. 1.0 cut that day's
+# Little Black tops to ~5,500 ft, under the cloud decks observed.
+CUMULUS_ENTRAINMENT_PER_KM = 0.5
+
+_CP, _LV, _G, _EPS = 1005.7, 2.501e6, 9.80665, 0.622
+
+
+def _saturation_mixing_ratio(t_c, p_hpa):
+    """kg/kg over water, Bolton's (1980) vapour pressure."""
+    es = 6.112 * math.exp(17.67 * t_c / (t_c + 243.5))
+    return _EPS * es / (p_hpa - es)
+
+
+def _cloudy_air(static_energy, height, total_water, p_hpa):
+    """(temperature degC, vapour, liquid) of air with this moist static
+    energy and total water at this height and pressure, saturated with
+    the rest as liquid -- or None if there isn't the water to stay
+    saturated, i.e. the cloud has evaporated."""
+    target = static_energy - _G * height
+    low, high = -100., 60.
+    for _ in range(40):
+        mid = (low + high) / 2
+        if _CP * (mid + 273.15) + _LV * _saturation_mixing_ratio(mid, p_hpa) > target:
+            high = mid
+        else:
+            low = mid
+    t = (low + high) / 2
+    vapour = _saturation_mixing_ratio(t, p_hpa)
+    if vapour > total_water:
+        return None
+    return t, vapour, total_water - vapour
+
+
+def cumulus_top(profile, entrainment_per_km=CUMULUS_ENTRAINMENT_PER_KM):
     """(pressure hPa, capped) of the top of the cumulus a thermal makes
-    at its condensation level: where the surface parcel, rising moist
-    above it, is first no longer warmer than the air around it -- the
-    usual estimate of how tall the cloud can build. A parcel no warmer
-    than the air just above its base makes a flat cloud, topped at the
-    base. capped: still warmer at the top of the profile, so the cloud
-    goes higher than the levels fetched say."""
+    at its condensation level.
+
+    The surface parcel followed on up from its base, saturated, mixing
+    in entrainment_per_km of the air around it as it climbs: the top is
+    where it is first no longer warmer than that air (virtual
+    temperature, its liquid water counted as weight) or where the mixing
+    has left it too dry to stay cloud. Unmixed -- the textbook parcel,
+    entrainment_per_km=0 -- the top is the equilibrium level, which is
+    how tall the instability lets a cloud get, not how tall it does:
+    on 2026-10-22 that put Little Black's cumulus past 18,500 ft at five
+    hours where none grew past ~10,000, the air above being 10-30 %
+    humidity, which a real cloud mixes in and evaporates against.
+    Needs the dewpoint at every level above the base; a level without
+    one is passed through unmixed.
+
+    A parcel no warmer than the air just above its base makes a flat
+    cloud, topped at the base. capped: still cloud and still rising at
+    the top of the profile."""
     p, T, parcel, lcl_pressure = _surface_parcel(profile)
     lcl = lcl_pressure.m
-    above = p.m < lcl
-    excess_at_base = (np.interp(lcl, p.m[::-1], parcel.m[::-1])
-                      - np.interp(lcl, p.m[::-1], T.m[::-1]))
-    # From the base up: pressures and the parcel's excess warmth there.
-    levels = np.concatenate([[lcl], p.m[above]])
-    excess = np.concatenate([[excess_at_base], (parcel.m - T.m)[above]])
-    colder = np.nonzero(excess <= 0)[0]
-    if len(colder) == 0:
-        return float(levels[-1]), True
-    i = colder[0]
-    if i == 0:
+    pressures, temperatures = p.m, T.m
+    heights = profile['height'].values
+    dewpoints = profile['dewpoint'].values
+    log_p = np.log(pressures[::-1])
+
+    def at_base(values):
+        return float(np.interp(np.log(lcl), log_p, values[::-1]))
+
+    def virtual(t_c, vapour, liquid=0.):
+        return (t_c + 273.15) * (1 + vapour / _EPS) / (1 + vapour + liquid)
+
+    last_height, base_t = at_base(heights), at_base(parcel.m)
+    water = _saturation_mixing_ratio(base_t, lcl)
+    energy = _CP * (base_t + 273.15) + _G * last_height + _LV * water
+    env_t, env_td = at_base(temperatures), at_base(dewpoints)
+    env_vapour = (_saturation_mixing_ratio(env_td, lcl) if np.isfinite(env_td)
+                  else _saturation_mixing_ratio(env_t, lcl))
+    last = (lcl, virtual(base_t, water) - virtual(env_t, env_vapour))
+    if last[1] <= 0:
         return float(lcl), False
-    # The crossing, between the last level still warmer and the first not,
-    # in log pressure.
-    fraction = excess[i - 1] / (excess[i - 1] - excess[i])
-    top = np.exp(np.log(levels[i - 1]) + fraction * (np.log(levels[i]) - np.log(levels[i - 1])))
-    return float(top), False
+
+    for i in np.nonzero(pressures < lcl)[0]:
+        pressure, height = pressures[i], heights[i]
+        env_t, env_td = temperatures[i], dewpoints[i]
+        if np.isfinite(env_td):
+            env_vapour = _saturation_mixing_ratio(env_td, pressure)
+            mix = min(1., entrainment_per_km * (height - last_height) / 1000)
+            env_energy = _CP * (env_t + 273.15) + _G * height + _LV * env_vapour
+            energy += mix * (env_energy - energy)
+            water += mix * (env_vapour - water)
+        else:
+            env_vapour = _saturation_mixing_ratio(env_t, pressure)
+        last_height = height
+        cloud = _cloudy_air(energy, height, water, pressure)
+        excess = -1. if cloud is None else virtual(*cloud) - virtual(env_t, env_vapour)
+        if excess <= 0:
+            # The top, between the last level still cloud and buoyant and
+            # this one, in log pressure.
+            fraction = last[1] / (last[1] - excess)
+            return float(np.exp(np.log(last[0])
+                                + fraction * (np.log(pressure) - np.log(last[0])))), False
+        last = (pressure, excess)
+    return float(last[0]), True
 
 
 # Shape of a thermal's strength with height, from Lenschow & Stephens
@@ -740,7 +831,7 @@ def _analyse(valid, run, lead, point, terrain_height, heat_flux):
     hour = Hour(valid, run, lead, terrain_height, profile, heat_flux=heat_flux,
                 cloud=tuple(point.get(label) for label in SURFACE_LABELS[-3:]),
                 gust_kt=point['GUST:surface'] * MS_TO_KT if 'GUST:surface' in point else None,
-                rain_mm_h=point[RAIN_LABEL] * 3600 if RAIN_LABEL in point else None)
+                rain_mm_h=point.get(RAIN_LABEL))
 
     hour.top_pressure, is_cloud_base = thermal_top(profile)
     if hour.top_pressure is not None:
@@ -942,9 +1033,10 @@ def forecast(lat, lon, day, models=None, progress=None, launch_m=None, plan=None
 
         surface_pressures = [point['PRES:surface'] / 100. for point in surface.values()]
 
-        def analyse(top_mb):
+        def analyse(top_mb, all_humidity=False):
             nonlocal downloaded
-            levels, humidity = _wanted_levels(source.levels, surface_pressures, top_mb)
+            levels, humidity = _wanted_levels(source.levels, surface_pressures, top_mb,
+                                              all_humidity)
             labels = _level_labels(levels, humidity)
             hours = []
             for valid, hour_file in files.items():
@@ -961,14 +1053,15 @@ def forecast(lat, lon, day, models=None, progress=None, launch_m=None, plan=None
         hours, fetched_top = analyse(top_mb)
         # A thermal that climbs to the top of what was fetched has only
         # been measured against the levels that were there, and a cumulus
-        # still building there has no top yet: pull the rest and work the
-        # day out again (the first pass's messages are already down).
-        if fetched_top > LEVEL_TOP_MB and any(
-                (hour.top_pressure is not None
-                 and hour.top_pressure < fetched_top + EXTEND_WITHIN_MB) or hour.cu_top_capped
-                for hour in hours):
+        # needs the humidity of the air it grows into, as high as it might
+        # go: pull the rest and work the day out again (the first pass's
+        # messages are already down).
+        cumulus = any(hour.cu_base_m is not None for hour in hours)
+        if cumulus or (fetched_top > LEVEL_TOP_MB and any(
+                hour.top_pressure is not None and hour.top_pressure < fetched_top + EXTEND_WITHIN_MB
+                for hour in hours)):
             total += len(files)
-            hours, _ = analyse(LEVEL_TOP_MB)
+            hours, _ = analyse(LEVEL_TOP_MB, all_humidity=cumulus)
 
     return PointForecast(lat, lon, day, source, hours, sunrise, sunset,
                          top_level_m=min(hour.profile['height'].iloc[-1] for hour in hours),
