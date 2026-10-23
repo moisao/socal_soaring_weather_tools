@@ -120,8 +120,13 @@ def who(update):
     they say nothing about anyone to whoever reads the logs."""
     user = update.effective_user
     chat = update.effective_chat
+    message = update.effective_message
     sender = f'user {user.id}' if user else 'unknown user'
-    return f'{sender} in {chat.type} chat {chat.id}' if chat else sender
+    if chat is None:
+        return sender
+    topic = (f' topic {message.message_thread_id}'
+             if message is not None and message.is_topic_message else '')
+    return f'{sender} in {chat.type} chat {chat.id}{topic}'
 
 
 def _text(update, context, name):

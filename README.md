@@ -391,7 +391,10 @@ how long the reply took.
 2026-10-16 09:12:07 INFO commands: /pf lb 17 -> ok in 4.2s [site=Little Black, model=rrfs, day=1]: RRFS 3 km, runs 16 06Z, 0 MB downloaded
 ```
 
-Users and chats are logged by ID, never by username or group title. The
+Users and chats are logged by ID, never by username or group title, and
+in a group with topics, the topic too ("... in supergroup chat -100…
+topic 7"). Everything the bot sends goes back into the topic it was
+asked in. The
 bot being added to or removed from a chat is logged too, as is a group
 becoming a supergroup (which changes its ID):
 

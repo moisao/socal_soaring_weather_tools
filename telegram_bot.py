@@ -308,7 +308,8 @@ async def _render_and_reply(update: Update, argv: list, timeout: int, label: str
             await status.edit_text(text)
 
         async def send(photo):
-            await status.get_bot().send_photo(status.chat_id, photo)
+            await status.get_bot().send_photo(status.chat_id, photo,
+                                              message_thread_id=_topic(status))
             with contextlib.suppress(Exception):
                 await status.delete()
 
@@ -349,6 +350,14 @@ async def _render_and_reply(update: Update, argv: list, timeout: int, label: str
     command.done('ok', f'{"replayed" if replayed else "rendered"} {png.name}')
     with open(png, 'rb') as photo:
         await send(photo)
+
+
+def _topic(message):
+    """The forum topic a message is in, for sending more into the same
+    one, or None outside topics. Message.reply_* do this themselves; a
+    bare bot.send_* doesn't, and in a group with topics it lands in the
+    top one, General."""
+    return message.message_thread_id if message.is_topic_message else None
 
 
 def _day_of(iso_text):
@@ -639,7 +648,8 @@ async def _send_point_forecast(status, site, day, models, reply_to, retry):
     if reply_to is not None:
         await reply_to.reply_media_group(media)
     else:
-        await status.get_bot().send_media_group(status.chat_id, media)
+        await status.get_bot().send_media_group(status.chat_id, media,
+                                                message_thread_id=_topic(status))
     # Into the archive with every other image sent (see POINT_FORECAST_DIR).
     for path in paths:
         with contextlib.suppress(OSError):
