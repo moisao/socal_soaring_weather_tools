@@ -12,6 +12,7 @@ Served on METRICS_PORT when that is set (see telegram_bot.main); with it
 unset nothing listens, so a local run doesn't claim a port.
 """
 
+import asyncio
 import contextvars
 import functools
 import logging
@@ -19,7 +20,7 @@ import re
 import time
 from datetime import datetime
 
-from prometheus_client import Counter, Histogram, disable_created_metrics, start_http_server
+from prometheus_client import Counter, Gauge, Histogram, disable_created_metrics, start_http_server
 
 logger = logging.getLogger('commands')
 
@@ -41,6 +42,24 @@ REQUESTS_TOTAL = Counter(
     'soaring_bot_requests',
     'Successful commands, by what they were for: site (or station), the model that '
     'answered, and how many days ahead.', ['command', 'site', 'model', 'day'])
+
+# Who uses the bot, by Telegram user ID (as in the logs; never a
+# username). A series per user, which is fine at a club's few dozen.
+# Unique users over a range: max_over_time(last seen) inside it, by user
+# -- by user, since a restart starts each one's series again under the
+# new pod.
+USER_LAST_SEEN = Gauge(
+    'soaring_bot_user_last_seen_seconds',
+    'When each user last sent a command, Unix time.', ['user'])
+USER_COMMANDS = Counter(
+    'soaring_bot_user_commands', 'Commands sent, by user ID, whatever their outcome.', ['user'])
+# A new series' first increment is invisible to increase() -- the series
+# appears already at 1 -- and unlike the other counters these can't be
+# created up front. So a user's first command creates theirs at 0 and
+# counts itself after this long, two scrapes later (the ServiceMonitor
+# scrapes every 30 s).
+FIRST_COUNT_DELAY_S = 70
+_users_seen = set()
 
 _current = contextvars.ContextVar('command')
 
@@ -114,6 +133,20 @@ def current():
     return _current.get(None) or Command('', '')
 
 
+def _count_user(update):
+    user = update.effective_user
+    if user is None:
+        return
+    label = str(user.id)
+    USER_LAST_SEEN.labels(label).set(time.time())
+    counter = USER_COMMANDS.labels(label)
+    if label in _users_seen:
+        counter.inc()
+    else:
+        _users_seen.add(label)
+        asyncio.get_running_loop().call_later(FIRST_COUNT_DELAY_S, counter.inc)
+
+
 def who(update):
     """Who sent it and where, by ID only -- 'user 42 in group chat -100...'.
     IDs rather than usernames or group titles: they don't change, and
@@ -149,6 +182,7 @@ def tracked(name):
             command = Command(name, text)
             token = _current.set(command)
             logger.info('%s from %s', text, who(update))
+            _count_user(update)
             started = time.monotonic()
             try:
                 await handler(update, context)

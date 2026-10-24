@@ -133,6 +133,9 @@ been split into modules.
   model's rain rate at the surface, shading each cloud from base to top
   and drawing it raining (a cloud glyph with drawn streaks: the fonts
   have no rain cloud) when the model has rain that hour.
+- Per-user metrics by Telegram user ID, last seen and commands sent, for
+  counting unique users. A user's first command counts itself a minute
+  late so that increase() sees it.
 - In a group with topics, a menu's result went to the top topic
   (General): it was sent with bot.send_*, which, unlike the reply_* the
   typed commands use, doesn't carry the topic over. It now goes back into

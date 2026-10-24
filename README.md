@@ -391,6 +391,9 @@ how long the reply took.
 2026-10-16 09:12:07 INFO commands: /pf lb 17 -> ok in 4.2s [site=Little Black, model=rrfs, day=1]: RRFS 3 km, runs 16 06Z, 0 MB downloaded
 ```
 
+Each user is also counted by Telegram user ID — when they last sent a
+command (`soaring_bot_user_last_seen_seconds`) and how many
+(`soaring_bot_user_commands_total`) — for the dashboard's unique users.
 Users and chats are logged by ID, never by username or group title, and
 in a group with topics, the topic too ("... in supergroup chat -100…
 topic 7"). Everything the bot sends goes back into the topic it was
