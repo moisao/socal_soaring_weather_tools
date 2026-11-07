@@ -147,7 +147,8 @@ $PY point_forecast.py --lat 32.988 --lon -117.122 --name "Little Black"
 $PY point_forecast.py --lat 32.988 --lon -117.122 --date sat --model hrrr
 ```
 
-One site, one local day, every hour the sun is up, as two tables of
+One site, one local day, every hour the sun is up and the hour after
+sunset, as two tables of
 altitude (every 250 ft MSL) against hour — `PF_<MODEL>_<lat>_<lon>_<day>_run<run>_thermals.png`
 and `…_wind.png`:
 
