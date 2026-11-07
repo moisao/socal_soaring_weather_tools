@@ -136,6 +136,8 @@ been split into modules.
 - Per-user metrics by Telegram user ID, last seen and commands sent, for
   counting unique users. A user's first command counts itself a minute
   late so that increase() sees it.
+- The point forecast runs an hour past sunset: with the sun down at
+  4:54 it ended at 4pm, though the wind at 5 is still worth knowing.
 - In a group with topics, a menu's result went to the top topic
   (General): it was sent with bot.send_*, which, unlike the reply_* the
   typed commands use, doesn't carry the topic over. It now goes back into

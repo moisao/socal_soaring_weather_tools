@@ -910,7 +910,9 @@ def sun_times(lat, lon, day):
 
 
 def daylight_hours(lat, lon, day):
-    """Every whole UTC hour from sunrise to sunset on a local day."""
+    """Every whole UTC hour from sunrise to sunset on a local day, and
+    the first one after sunset: with the sun down at 4:54, the wind at
+    5:00 is still worth knowing."""
     sun = sun_times(lat, lon, day)
     if sun is None:
         return []
@@ -921,6 +923,7 @@ def daylight_hours(lat, lon, day):
     while hour <= sun[1]:
         hours.append(hour)
         hour += timedelta(hours=1)
+    hours.append(hour)
     return hours
 
 
