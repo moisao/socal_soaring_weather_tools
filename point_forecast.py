@@ -18,6 +18,8 @@ _wanted_levels) and each is reduced to its one grid point as it is read.
 """
 
 import argparse
+import contextlib
+import fcntl
 import json
 import math
 import os
@@ -307,13 +309,30 @@ class HourFile:
         stem = f'{source.cache_prefix}_{run:%Y%m%d_%HZ}_f{lead:03d}.point'
         self.grib_path = CACHE_DIR / f'{stem}.grib2'
         self.index_path = CACHE_DIR / f'{stem}.json'
-        self.index = {'size': 0, 'messages': [], 'absent': [], 'points': {}}
+        self.index = self._read_index()
+
+    def _read_index(self):
         try:
             index = json.loads(self.index_path.read_text())
             if self.grib_path.stat().st_size >= index['size']:
-                self.index = {'points': {}, **index}
+                return {'points': {}, **index}
         except (OSError, ValueError, KeyError):
             pass
+        return {'size': 0, 'messages': [], 'absent': [], 'points': {}}
+
+    @contextlib.contextmanager
+    def _locked(self):
+        """Hold the file against every other writer -- other processes
+        sharing the cache (home_forecast.py beside the bot) as well as
+        other threads -- and pick up whatever they wrote before us.
+
+        flock on the GRIB2 file itself, which is only ever appended to,
+        never replaced, unlike the sidecar. Each open() is its own lock,
+        so threads in one process exclude each other too."""
+        with open(self.grib_path, 'ab') as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            self.index = self._read_index()
+            yield
 
     def _save_index(self):
         tmp = self.index_path.with_suffix('.json.part')
@@ -327,15 +346,23 @@ class HourFile:
         """Fetch whichever of these labels the file doesn't hold yet.
         Returns the bytes downloaded. A label the model simply doesn't
         publish at this lead is remembered as absent, not retried."""
+        if not set(labels) - self.labels() - set(self.index['absent']):
+            return 0
+        with self._locked():
+            return self._ensure(labels, session, pool)
+
+    def _ensure(self, labels, session, pool):
         missing = set(labels) - self.labels() - set(self.index['absent'])
         if not missing:
             return 0
-        surface = _surface_labels(self.source)
+        # Isobaric levels from the profile product, everything else (2 m,
+        # 10 m, surface, whole-column cloud...) from the surface product.
+        isobaric = {label for label in missing if label.endswith(' mb')}
         if self.source.surface_product == self.source.profile_product:
             by_product = {self.source.profile_product: missing}
         else:
-            by_product = {self.source.profile_product: missing - surface,
-                          self.source.surface_product: missing & surface}
+            by_product = {self.source.profile_product: isobaric,
+                          self.source.surface_product: missing - isobaric}
 
         messages, blobs = [], []
         for product, wanted in by_product.items():
@@ -396,11 +423,25 @@ class HourFile:
         request. A message's value at a point never changes, so they need
         no invalidating; a label appended since is simply decoded the
         next time it's asked for."""
-        wanted = self.labels() if labels is None else set(labels)
-        present = wanted & self.labels()
         keys = [f'{lat:.5f},{lon:.5f}' for lat, lon in points]
-        cached = [self.index['points'].get(key) or {'_times': {}} for key in keys]
-        todo = [i for i, point in enumerate(cached) if not present <= point.keys()]
+
+        def lookup():
+            wanted = self.labels() if labels is None else set(labels)
+            present = wanted & self.labels()
+            cached = [self.index['points'].get(key) or {'_times': {}} for key in keys]
+            return wanted, cached, [i for i, point in enumerate(cached)
+                                    if not present <= point.keys()]
+
+        wanted, cached, todo = lookup()
+        if not todo:
+            return self._decoded(wanted, cached)
+        with self._locked():
+            wanted, cached, todo = lookup()
+            if todo:
+                self._decode_into(points, keys, wanted, cached, todo)
+        return self._decoded(wanted, cached)
+
+    def _decode_into(self, points, keys, wanted, cached, todo):
         if todo:
             with open(self.grib_path, 'rb') as f:
                 for message in self.index['messages']:
@@ -438,6 +479,9 @@ class HourFile:
             for i in todo:
                 self.index['points'][keys[i]] = cached[i]
             self._save_index()
+
+    @staticmethod
+    def _decoded(wanted, cached):
         return [{**{k: v for k, v in point.items() if k.startswith('_') and k != '_times'},
                  '_times': {k: v for k, v in point['_times'].items() if k in wanted},
                  **{k: v for k, v in point.items() if k in wanted}}

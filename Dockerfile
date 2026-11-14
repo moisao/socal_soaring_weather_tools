@@ -2,7 +2,8 @@
 #
 # Telegram sounding bot (telegram_bot.py). Long-polls Telegram, so it needs
 # no inbound port -- only outbound HTTPS (Telegram, NOAA S3, THREDDS,
-# Wyoming, Open-Meteo, airportsapi).
+# Wyoming, Open-Meteo, airportsapi). home_forecast.py (same image, `python
+# home_forecast.py serve`) listens on HOME_FORECAST_PORT (8080).
 #
 #   docker build -t socal-soaring-bot .
 #   docker run -e TELEGRAM_BOT_TOKEN=... -v soaring-data:/data socal-soaring-bot
@@ -85,7 +86,7 @@ USER 10001
 # like the eckit one above at build time, not on the first chat request.
 # Then build matplotlib's font cache (~12 s that would otherwise land on
 # every new pod's first start) and fail if Fira Sans isn't discoverable.
-RUN python -c "import grib, Simple_Sounding, telegram_bot" \
+RUN python -c "import grib, Simple_Sounding, telegram_bot, home_forecast" \
     && python -c "from matplotlib import font_manager as fm; fm.findfont('Fira Sans', fallback_to_default=False)"
 
 CMD ["python", "telegram_bot.py"]

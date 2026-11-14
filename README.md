@@ -247,11 +247,48 @@ Everything lands in `cache/` (git-ignored):
 | `<MODEL>_terrain.npz` | Orography — static, so cached once per model rather than per run |
 | `<MODEL>_<run>_f<lead>.point.grib2` | Point-forecast messages for that hour; appended to as other sites ask for other levels |
 | `<...>.point.json` | What that file holds, in order, and each site's values decoded from it — so a repeat request decodes nothing |
+| `home_forecast_points.json` | Points `home_forecast.py` keeps current, so a restart picks them back up |
 | `point-forecast/PF_*.png` | Point-forecast tables as drawn, sent or not; the ones sent are copied into the archive |
 
 Fetches write to a `.part` file and rename on completion, so an
 interrupted run can't leave a truncated file that looks complete. The
 cache is keyed by run, never by point, so it only grows with new runs.
+
+The `.point.grib2` files are shared between processes as well as
+threads: a writer takes an exclusive `flock` on the file (only ever
+appended to, never replaced) and re-reads its sidecar first, so the bot
+and `home_forecast.py` can run on one cache directory without fetching
+the same message twice or losing each other's appends.
+
+## Home forecast
+
+`home_forecast.py` is the next 24 hours at one point for a household
+rather than a pilot -- temperature, humidity, dew point, 10 m wind and
+gust, the hour's rain, total cloud, a UV index and sunrise/sunset -- as
+JSON over HTTP, for Home Assistant:
+
+    python home_forecast.py --lat 32.95 --lon -117.10        # print once
+    python home_forecast.py serve --port 8080                # GET /forecast?lat=..&lon=..
+
+The hours come from the same model chain (RRFS, then HRRR; one model for
+all 24) and the same run-and-lead choice as a point forecast, and from
+the same `.point.grib2` files: run on the bot's cache, the daylight hours
+its point-forecast pre-warm has already fetched download nothing. The
+fields are `TMP`/`DPT` at 2 m, `UGRD`/`VGRD` at 10 m, `GUST`, the hour's
+`APCP` and whole-column `TCDC`, plus `DSWRF` and `CSDSF` while the sun is
+up. Humidity is from temperature and dewpoint; each hour carries a Home
+Assistant weather condition from its rain, cloud and wind.
+
+UV is an estimate -- the models publish no UV: 12.5 mu^2.42 for a clear
+sky (mu the cosine of the solar zenith angle), dimmed by the fraction of
+the clear-sky shortwave the model lets through, to the 0.6 since cloud
+dims UV less than it dims the whole shortwave.
+
+A new point is forecast on its first request (~250 MB of whole-grid
+messages for a cold run, ~100 s from a home connection, 503 "warming"
+after 20 s) and then refreshed in the background whenever the plan
+changes -- a new run or a new hour. ~250 MB per new RRFS run (they post
+3-hourly in the bucket), less whatever the bot already holds.
 
 ## Telegram bot
 
