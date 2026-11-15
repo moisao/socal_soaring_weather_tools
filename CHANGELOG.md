@@ -284,6 +284,33 @@ itself out of the way:
   soon as Wyoming posts it, so the first bare `/sounding` after a launch
   is a replay.
 
+## The GRIB decode, in Rust
+
+- `grib.py`'s decode is now `grib-profile` (`rust/`), run once per
+  subset and point. It unpacks one message at a time straight to the
+  value asked for, where the eccodes decode unpacked every message to a
+  full-grid array and held them all. Measured on the Pi 5 for a run's 185
+  isobaric messages: 17 s and 1.7 GB before, 0.4 s and 10 MB now. One
+  cold HRRR sounding had peaked at 3.55 GB, against the pod's 4 GB.
+- Checked against eccodes on real HRRR, RRFS and URMA files, at every
+  site and at 300 points across the grid: the same grid points and the
+  same values to the last bit (`rust/check_against_eccodes.py`).
+- The speed is the decoder's, not the language's: the `grib` crate took
+  as long as eccodes. The decoder here handles only what these files
+  contain (templates 5.0 and 5.3, no bitmap), stops at the last point
+  wanted, and has no dependencies.
+- With nothing held, the `.region.npz` crops, the decoded-field memo, its
+  lock and `clear_field_cache()` are gone. Orography is cached as the
+  GRIB2 message itself and read the same way.
+- **The grid point is now the nearest over the ground.** It was the
+  nearest in degrees of latitude and longitude, which counts a degree of
+  longitude as much as one of latitude. For Elsinore and Skyport that was
+  the next row over (2.13 km away rather than 2.06, and 1.69 rather than
+  1.68). Point forecasts pick their point the same way, and values they
+  had kept for the old point are decoded again.
+- A point off the model's grid is now an error, so the chain falls
+  through to the next model. It used to get the nearest edge point.
+
 ## Also found along the way
 
 - 1000 mb is the highest isobaric level either model publishes; there is

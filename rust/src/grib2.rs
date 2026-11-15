@@ -10,7 +10,7 @@ use crate::Result;
 
 /// Sign-and-magnitude integer of any width up to 8 bytes, as GRIB2 stores
 /// signed values.
-fn signed(bytes: &[u8]) -> i64 {
+pub fn signed(bytes: &[u8]) -> i64 {
     let magnitude = bytes.iter().enumerate().fold(0i64, |acc, (n, &b)| {
         (acc << 8) | i64::from(if n == 0 { b & 0x7f } else { b })
     });
@@ -21,7 +21,7 @@ fn signed(bytes: &[u8]) -> i64 {
     }
 }
 
-fn unsigned(bytes: &[u8]) -> u64 {
+pub fn unsigned(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0, |acc, &b| (acc << 8) | u64::from(b))
 }
 
@@ -316,5 +316,217 @@ mod tests {
         assert_eq!(power(-2, 10.0), 1.0 / 10.0 / 10.0);
         assert_eq!(power(3, 2.0), 8.0);
         assert_eq!(power(0, 10.0), 1.0);
+    }
+
+    /// Appends big-endian bit fields to a byte vector.
+    #[derive(Default)]
+    struct BitWriter {
+        bytes: Vec<u8>,
+        bits: usize,
+    }
+
+    impl BitWriter {
+        fn put(&mut self, value: u64, width: u32) {
+            for bit in (0..width).rev() {
+                if self.bits.is_multiple_of(8) {
+                    self.bytes.push(0);
+                }
+                *self.bytes.last_mut().unwrap() |=
+                    (((value >> bit) & 1) as u8) << (7 - self.bits % 8);
+                self.bits += 1;
+            }
+        }
+
+        fn into_octets(self) -> Vec<u8> {
+            self.bytes
+        }
+    }
+
+    fn sign_magnitude(value: i64, octets: usize) -> Vec<u8> {
+        let mut bytes = value.unsigned_abs().to_be_bytes()[8 - octets..].to_vec();
+        if value < 0 {
+            bytes[0] |= 0x80;
+        }
+        bytes
+    }
+
+    fn section(number: u8, body: &[u8]) -> Vec<u8> {
+        let mut s = ((body.len() + 5) as u32).to_be_bytes().to_vec();
+        s.push(number);
+        s.extend_from_slice(body);
+        s
+    }
+
+    /// A whole message around the given Section 5 and 7 bodies: TMP on
+    /// the 850 hPa surface, on the HRRR grid's definition.
+    fn message(section5: &[u8], section7: &[u8]) -> Vec<u8> {
+        let mut product = vec![0u8; 29];
+        product[17] = 100; // isobaric surface
+        product[19..23].copy_from_slice(&85_000u32.to_be_bytes());
+        let mut bytes = b"GRIB\0\0\0\x02\0\0\0\0\0\0\0\0".to_vec();
+        bytes.extend(section(1, &[0; 16]));
+        bytes.extend(crate::lambert::tests::hrrr_section3());
+        bytes.extend(section(4, &product));
+        bytes.extend(section(5, section5));
+        bytes.extend(section(6, &[255]));
+        bytes.extend(section(7, section7));
+        bytes.extend(b"7777");
+        bytes
+    }
+
+    /// Section 5's body up to the bit width: `points` values, template
+    /// `template`, reference 250.5, binary scale -2, decimal scale 1.
+    fn representation(points: usize, template: u16, bits: u8) -> Vec<u8> {
+        let mut s = (points as u32).to_be_bytes().to_vec();
+        s.extend(template.to_be_bytes());
+        s.extend(250.5f32.to_be_bytes());
+        s.extend(sign_magnitude(-2, 2));
+        s.extend(sign_magnitude(1, 2));
+        s.push(bits);
+        s.push(0); // original values are floating point
+        s
+    }
+
+    fn expected(packed: i64) -> f32 {
+        ((packed as f64 * 0.25 + 250.5) * (1.0 / 10.0)) as f32
+    }
+
+    /// Pack `field` with template 5.3 in groups of `group_length`, the
+    /// way an encoder would: differences, minus their minimum, then each
+    /// group's values minus the group's own minimum.
+    fn complex_message(field: &[i64], order: usize, group_length: usize) -> Vec<u8> {
+        let mut differences = vec![0i64; field.len()];
+        for n in order..field.len() {
+            differences[n] = match order {
+                1 => field[n] - field[n - 1],
+                _ => field[n] - 2 * field[n - 1] + field[n - 2],
+            };
+        }
+        let minimum = *differences[order..].iter().min().unwrap();
+        let mut packed: Vec<i64> = differences.iter().map(|d| d - minimum).collect();
+        packed[..order].fill(0);
+
+        let groups: Vec<&[i64]> = packed.chunks(group_length).collect();
+        let references: Vec<i64> = groups.iter().map(|g| *g.iter().min().unwrap()).collect();
+        let widths: Vec<u32> = groups
+            .iter()
+            .zip(&references)
+            .map(|(g, r)| 64 - ((g.iter().max().unwrap() - r) as u64).leading_zeros())
+            .collect();
+        let reference_bits = 64 - (*references.iter().max().unwrap() as u64).leading_zeros();
+
+        let mut s5 = representation(field.len(), 3, reference_bits as u8);
+        s5.push(1); // general group splitting
+        s5.push(0); // no missing values
+        s5.extend([0; 8]);
+        s5.extend((groups.len() as u32).to_be_bytes());
+        s5.push(0); // reference for group widths
+        s5.push(6); // bits per group width
+        s5.extend((group_length as u32).to_be_bytes()); // reference for group lengths
+        s5.push(1); // length increment
+        s5.extend((groups.last().unwrap().len() as u32).to_be_bytes());
+        s5.push(1); // bits per scaled group length
+        s5.push(order as u8);
+        s5.push(3); // octets per extra descriptor
+
+        let mut s7 = Vec::new();
+        for value in &field[..order] {
+            s7.extend(sign_magnitude(*value, 3));
+        }
+        s7.extend(sign_magnitude(minimum, 3));
+        let mut writer = BitWriter::default();
+        references
+            .iter()
+            .for_each(|r| writer.put(*r as u64, reference_bits));
+        s7.extend(writer.into_octets());
+        let mut writer = BitWriter::default();
+        widths.iter().for_each(|w| writer.put(u64::from(*w), 6));
+        s7.extend(writer.into_octets());
+        let mut writer = BitWriter::default();
+        groups.iter().for_each(|_| writer.put(0, 1));
+        s7.extend(writer.into_octets());
+        let mut writer = BitWriter::default();
+        for ((group, reference), width) in groups.iter().zip(&references).zip(&widths) {
+            group
+                .iter()
+                .for_each(|p| writer.put((p - reference) as u64, *width));
+        }
+        s7.extend(writer.into_octets());
+        message(&s5, &s7)
+    }
+
+    /// A field with smooth stretches, jumps, a constant run (a group of
+    /// width 0) and negative values.
+    fn field() -> Vec<i64> {
+        (0..1000i64)
+            .map(|n| match n {
+                300..400 => 77,
+                _ => (n * n) % 997 - 300 + n / 7,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn complex_packing_round_trips() {
+        let field = field();
+        for (order, group_length) in [(2, 7), (2, 64), (1, 7), (1, 1000)] {
+            let bytes = complex_message(&field, order, group_length);
+            let message = Message::parse(&bytes).unwrap();
+            let wanted: Vec<usize> = (0..field.len()).collect();
+            let mut out = vec![f32::NAN; wanted.len()];
+            message.values_at(&wanted, &mut out).unwrap();
+            let want: Vec<f32> = field.iter().map(|v| expected(*v)).collect();
+            assert_eq!(out, want, "order {order}, groups of {group_length}");
+        }
+    }
+
+    #[test]
+    fn complex_packing_picks_points_and_repeats() {
+        let field = field();
+        let bytes = complex_message(&field, 2, 7);
+        let message = Message::parse(&bytes).unwrap();
+        let wanted = [0, 1, 2, 350, 350, 998, 999];
+        let mut out = [f32::NAN; 7];
+        message.values_at(&wanted, &mut out).unwrap();
+        assert_eq!(out.to_vec(), wanted.map(|n| expected(field[n])).to_vec());
+        assert!(message.values_at(&[1000], &mut [0.0]).is_err());
+    }
+
+    #[test]
+    fn simple_packing() {
+        let field: Vec<i64> = (0..50).map(|n| (n * 37) % 1024).collect();
+        let mut writer = BitWriter::default();
+        field.iter().for_each(|v| writer.put(*v as u64, 11));
+        let bytes = message(&representation(field.len(), 0, 11), &writer.into_octets());
+        let message = Message::parse(&bytes).unwrap();
+        let wanted = [0, 7, 7, 49];
+        let mut out = [f32::NAN; 4];
+        message.values_at(&wanted, &mut out).unwrap();
+        assert_eq!(out.to_vec(), wanted.map(|n| expected(field[n])).to_vec());
+    }
+
+    #[test]
+    fn product_and_truncation() {
+        let bytes = complex_message(&field(), 2, 7);
+        let product = Message::parse(&bytes).unwrap().product().unwrap();
+        assert_eq!((product.category, product.number), (0, 0));
+        assert_eq!(
+            (product.surface_type, product.surface_value),
+            (100, 85_000.0)
+        );
+        assert!(Message::parse(&bytes[..bytes.len() - 40]).is_err());
+        // Values cut short, with the section lengths still consistent.
+        let mut short = bytes.clone();
+        let cut = 200;
+        short.drain(bytes.len() - 4 - cut..bytes.len() - 4);
+        let section7 = short.len() - 4 - (section7_len(&bytes) - cut);
+        let len = (section7_len(&bytes) - cut) as u32;
+        short[section7..section7 + 4].copy_from_slice(&len.to_be_bytes());
+        let message = Message::parse(&short).unwrap();
+        assert!(message.values_at(&[999], &mut [0.0]).is_err());
+    }
+
+    fn section7_len(bytes: &[u8]) -> usize {
+        Message::parse(bytes).unwrap().data.len()
     }
 }

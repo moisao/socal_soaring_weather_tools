@@ -61,7 +61,6 @@ from telegram.ext import (Application, CallbackQueryHandler, ChatMemberHandler, 
                           ContextTypes, MessageHandler, filters)
 
 import forecast_table
-import grib
 import metrics
 import point_forecast
 import Simple_Sounding
@@ -142,10 +141,10 @@ REQUESTS = _Requests()
 def _release_freed_memory():
     """Hand memory the allocator is holding back to the OS.
 
-    Freeing a ~950 MB run's field arrays returns them to glibc, which
-    keeps them on its own free lists rather than to the kernel -- so RSS
-    stays high and a long-lived service looks like it is leaking when it
-    isn't. malloc_trim releases what it can. Paired with MALLOC_ARENA_MAX
+    What a render frees (figures, a run's downloaded messages) goes back
+    to glibc, which keeps it on its own free lists rather than returning
+    it to the kernel -- so RSS stays high and a long-lived service looks
+    like it is leaking when it isn't. malloc_trim releases what it can. Paired with MALLOC_ARENA_MAX
     in the systemd unit, which stops the fetch pool's threads each
     building their own arena in the first place.
 
@@ -183,17 +182,6 @@ def load_sites():
                 elevation = int(m.group(4)) if m.group(4) else None
                 sites.append(Site(m.group(1), float(m.group(2)), float(m.group(3)), elevation, aliases))
     return sites
-
-
-def sites_region(sites, margin=0.25):
-    """(lat_min, lat_max, lon_min, lon_max) around every named site, with
-    `margin` degrees to spare -- the area grib.set_region keeps on hand.
-    None without any sites."""
-    if not sites:
-        return None
-    lats = [site.lat for site in sites]
-    lons = [site.lon for site in sites]
-    return (min(lats) - margin, max(lats) + margin, min(lons) - margin, max(lons) + margin)
 
 
 def match_site(args):
@@ -276,10 +264,6 @@ def _render(argv: list, request=True) -> tuple:
         try:
             rendered = Simple_Sounding.render(args, output_dir=OUTPUT_DIR)
         finally:
-            # The decoded-field memo pays off across sites in one batch;
-            # here each request is usually a different run, so it would
-            # just pin ~1 GB for the life of the service.
-            grib.clear_field_cache()
             _release_freed_memory()
         REPLAY.record(args, rendered)
     return Path(f'{rendered.stub}.png'), False
@@ -955,8 +939,7 @@ def _prewarm_loop(hours):
     Asks for exactly what /site would (fetch_model_profile at a valid
     time, the same model chain), so whatever run and lead a request
     resolves to is the one already cached. One site's point is enough:
-    the subsets are the whole grid, and the region crop the decode
-    leaves behind (grib.set_region) covers every site.
+    the subsets are the whole grid.
 
     Not under _render_lock: a download here would otherwise hold up
     every request for its whole length. grib's own per-file locks keep a
@@ -966,7 +949,6 @@ def _prewarm_loop(hours):
         now = datetime.now(LOCAL_TZ)
         sites = load_sites()
         if sites and now.hour in hours:
-            grib.set_region(sites_region(sites))
             lat, lon = sites[0].lat, sites[0].lon
             for ahead in (0, 1):
                 valid = now + timedelta(hours=ahead)
@@ -980,7 +962,6 @@ def _prewarm_loop(hours):
                 except Exception:
                     logger.exception('Pre-warm for %s failed', f'{valid:%H:00}')
                 finally:
-                    grib.clear_field_cache()
                     _release_freed_memory()
         time.sleep(PREWARM_INTERVAL.total_seconds())
 
@@ -1111,9 +1092,6 @@ def main() -> None:
 
     metrics.initialise([site.name for site in load_sites()], os.environ.get('METRICS_PORT'))
 
-    # Set here as well as by the pre-warm, so a cold request's decode
-    # leaves a region crop behind for the next site even with it off.
-    grib.set_region(sites_region(load_sites()))
     hours = prewarm_hours(os.environ.get('SOUNDING_PREWARM'))
     if hours:
         threading.Thread(target=_prewarm_loop, args=(hours,), name='prewarm', daemon=True).start()
