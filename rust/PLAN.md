@@ -1,8 +1,11 @@
 # Rust GRIB path: plan and handoff
 
-Status as of 2026-11-14. Nothing is built yet: work stopped while we set up
-the dev environment (see "Blocker" below). This file is the handoff for any
-agent continuing the work. Update the Status and Next steps sections as you go.
+Status as of 2026-11-14: the proof of concept is built and measured on the
+Pi 5 pod. The Rust decode returns the same grid points and bit-identical
+values as the current Python, in about 1/40 of the wall time, 1/12 of the CPU
+and 1/100 of the memory. Nothing is wired into the bot yet; that is the next
+decision (see "Recommendation" and "Next steps"). This file is the handoff
+for any agent continuing the work. Update it as you go.
 
 ## Goal
 
@@ -16,8 +19,8 @@ Decisions so far (agreed with the user):
   (Skew-T, tables) are the expensive parts to port and stay in Python for now.
 - The GRIB path goes first: it is self-contained, uses the most memory, and is
   easy to verify (same file and point in, same numbers out).
-- The plan must state approximate CPU and memory differences, so we follow
-  whichever path is most efficient, not "Rust for its own sake".
+- Follow whichever path measures as most efficient, not "Rust for its own
+  sake".
 
 ## How the current Python path works (grib.py)
 
@@ -35,113 +38,145 @@ Decisions so far (agreed with the user):
   earth-relative with the LCC cone constant (`_lcc_cone_constant`) and `LoV`.
 - `set_region` makes `_load_fields` also write a cropped `.region.npz` around
   the bot's sites, so later requests for the same run skip the full decode.
-  `telegram_bot.py` calls `grib.set_region(...)` (lines ~969, ~1116) and
-  `grib.clear_field_cache()` (lines ~282, ~983).
+  `telegram_bot.py` calls `grib.set_region(...)` and
+  `grib.clear_field_cache()`.
 - Note: `_fetch_grib_profile`'s docstring still says each message is reduced
   to its nearest point "so the full 2D field is never materialized". That's
   stale: `_load_fields` materializes everything.
 
-Numbers already recorded in grib.py's comments (measured on an M1, not the Pi):
-- About 3 s to decode one RRFS run (225 messages) to arrays; 3.6 s including
-  the KD-tree build.
-- About 950 MB of float32 for a 125-message RRFS subset, i.e. about 7.6 MB
-  per field (about 1.9M grid points). Subsets now hold more messages:
-  RRFS isobaric is about 185, HRRR isobaric about 185, HRRR native 228.
-- Subset sizes on disk: RRFS isobaric is about 270 to 310 MB; HRRR
-  isobaric is about 130 MB, and HRRR native is about 300 MB.
+## What was built
 
-## Plan, with expected CPU and memory differences
+- `rust/`: a standalone Cargo binary, `grib-profile`. The Docker image only
+  copies `*.py` and `sites.tsv`, so nothing here affects prod.
+  - `grib-profile SUBSET.grib2 (--sites sites.tsv | --point LAT,LON)...
+    [--threads N] [--decoder own|crate]` prints JSON: `cone`, `lov`, and per
+    point the grid index, the grid point's lat/lon and `{shortName_level:
+    value}` with eccodes' names (`t_850`, `10u_10`, `sp_0`...).
+  - `src/grib2.rs` is a hand-written decoder for exactly what these subsets
+    contain (see "Findings"): one field per message, no bitmap, data
+    representation templates 5.0 and 5.3. It decodes straight to the wanted
+    points, stops at the last one, and allocates nothing per message. It
+    scales values the way eccodes does (in f64, then narrowed), which is what
+    makes the output bit-identical.
+  - `src/main.rs` finds the grid point by inverting the Lambert Conformal
+    projection from Section 3 (no lat/lon arrays, no KD-tree), and decodes
+    messages on a few threads, one message in memory per thread.
+  - `--decoder crate` uses the `grib` crate (0.20) instead. It is only there
+    as a cross-check and a speed comparison, and it accounts for 34 of the 40
+    packages in `Cargo.lock`.
+- `rust/bench/py_baseline.py`: step 0, the current `grib._load_fields` at
+  every site, in the same JSON shape.
+- `rust/bench/py_streaming.py`: step 1, the same eccodes decode but one
+  message at a time, with the projection in place of the KD-tree.
+- `rust/bench/compare.py`: same grid index and float32-equal values, per
+  site and field.
+- `rust/bench/bench.sh SUBSET.grib2...`: runs all of the above and prints
+  the timings below.
 
-All figures are estimates from the numbers above plus usual Rust/Python
-overheads. They are what the PoC has to confirm or refute; replace them with
-measured Pi 5 numbers as they come in.
+## Findings
 
-The key point is that **most of the memory win comes from the algorithm, not the
-language.** The current code holds every decoded field of a run at once.
-Decoding one message at a time, pulling out the wanted points and the region
-crop, then dropping the array, means peak memory is about one field instead of
-a whole run. That works in Python too. So the plan measures that change on
-its own (step 1) before giving any credit to Rust.
+Measured on the pod (Pi 5, 4 cores, 4 GB memory limit) with one HRRR run
+(2026-11-15 02Z f00) and one RRFS run (2026-11-15 00Z f00), at the 20 sites in
+`sites.tsv`, page cache warm unless it says cold. "Decode" for Python excludes
+interpreter start and imports; Rust figures are the whole process.
 
-| Step | What | Peak memory per decode (HRRR isobaric, ~185 fields) | CPU per decode | Notes |
+| Subset | Current Python (step 0) | Streaming Python (step 1) | Rust, 4 threads (step 2) | Rust, 1 thread |
 |---|---|---|---|---|
-| 0 | Baseline: current Python | ~1.4 GB of fields, plus float64 temporaries from eccodes, lat/lon arrays (~30 MB), KD-tree (~50 to 100 MB), and the Python and numpy interpreter (~150 to 250 MB RSS) | ~3 s on M1; probably 6 to 10 s on Pi 5 (to measure), single-threaded | Measure first, on the Pi |
-| 1 | Python, streaming: decode, extract points and crop, drop | ~30 to 60 MB above interpreter baseline | Same decode, minus the KD-tree build (~0.5 s) | Replace the KD-tree with an LCC inverse projection, so lat/lon arrays aren't needed either. Small, low-risk change |
-| 2 | Rust CLI, streaming, pure-Rust decode (`grib` crate) | ~10 to 40 MB total process RSS | Decode CPU probably comparable to eccodes (0.7 to 1.5x; eccodes is already C). Wall time ~3 to 4x better from decoding messages in parallel on 4 cores | Also drops eccodes and its double-free clash with pyproj |
-| 2b | Rust CLI calling system `libeccodes` via FFI | Same as 2 | Same decode CPU as Python | Isolates language effect from decoder effect. Optional |
-| 3 | Rust download path (reqwest/tokio, direct S3 URLs plus `.idx` parsing instead of Herbie) | Small | Network-bound, so little CPU difference; latency win from skipping Herbie's mirror walks (~0.6 to 1.1 s per miss) | Could also be done in Python by replacing Herbie |
-| 4 | Expose to the bot via PyO3/maturin (or a subprocess call) | Python baseline stays | Same as 2 | Only if 2 beats 1 by enough to justify the extra build step in the Docker image |
+| HRRR isobaric, 185 fields, 126 MB | 16.8 s, 1.68 GB | 18.4 s, 84 MB | 0.44 s (1.4 s CPU), 10 MB; cold 1.2 s | 1.4 s, 5 MB |
+| HRRR native, 228 fields, 308 MB | 21.8 s, 2.00 GB | 24.7 s, 86 MB | 0.54 s (2.0 s CPU), 18 MB; cold 2.3 s | 1.9 s, 9 MB |
+| HRRR surface, 5 fields, 9 MB | 3.2 s, 345 MB | 0.7 s, 84 MB | 0.01 s, 8 MB | 0.04 s, 6 MB |
+| RRFS isobaric, 185 fields, 283 MB | 18.4 s, 1.68 GB | 20.5 s, 86 MB | 0.47 s (1.8 s CPU), 18 MB; cold 2.1 s | 1.5 s, 7 MB |
+| RRFS surface, 5 fields, 9 MB | 3.4 s, 344 MB | 0.8 s, 86 MB | 0.02 s, 9 MB | 0.05 s, 6 MB |
 
-Expected outcome, to be confirmed: step 1 captures most of the memory win
-(GB down to tens of MB). Step 2 adds a modest single-core CPU win, a large
-wall-time win through parallel decode, and a much smaller process. Steps 3 and 4
-depend on the measurements.
+Times are wall time; memory is peak RSS of the process. The current Python
+is single-threaded, so its CPU time is about its wall time.
 
-## PoC design (step 2)
+- **Correctness.** Rust, streaming Python and current Python pick the same
+  grid point for all 20 sites, and all 12,160 values are equal as float32.
+  The same holds at 302 points spread over the whole grid, corners included
+  (55,870 values on each isobaric subset), which exercises the decoder to
+  the end of the field.
+- **The whole Python request is worse than its parts.** One cold
+  `fetch_hrrr_profile` (download and decode of all three subsets) took 71 s
+  and peaked at 3.55 GB RSS, because `lru_cache(maxsize=3)` holds all three
+  decoded subsets at once. The pod's limit is 4 GB.
+- **Step 1 fixes memory but not CPU.** Streaming in Python brings peak memory
+  from 1.7 to 2.0 GB down to about 85 MB (most of that is the interpreter,
+  numpy and eccodes), but it is about 10% slower than today: eccodes still
+  decodes every full field (about 70 ms each), and allocating and freeing a
+  15 MB float64 array per message costs system time. It does remove the
+  ~3 s fixed cost of generating lat/lon arrays and building the KD-tree,
+  which is nearly all of the surface subsets' time.
+- **Rust's CPU win comes from the decoder, not the language.** With the
+  `grib` crate the decode takes 11.9 s single-threaded on HRRR isobaric,
+  about the same as eccodes, and it doesn't speed up past 2 threads. The
+  hand-written decoder takes 1.2 s of CPU for the same file. Part of that is
+  stopping early: the SoCal sites are 35 to 44% of the way through the grid.
+  Decoding to the very last grid point takes 0.9 s wall and 3.1 s CPU, about
+  17 ms per field against eccodes' 70 ms.
+- **Formats.** Every message is grid template 3.30 (Lambert Conformal,
+  1799 x 1059, spherical earth, scanning mode 64) with no bitmap. Data
+  representation is 5.3 (complex packing, second-order spatial differencing)
+  for all but a handful of messages that use 5.0 (simple packing). No
+  JPEG2000, so no C library is needed. RRFS is served on the same grid as
+  HRRR.
+- **Nearest grid point.** The KD-tree measures distance in degrees, treating
+  a degree of longitude like a degree of latitude, so it doesn't always
+  return the grid point nearest on the ground. Rust reproduces Python's
+  choice (it compares the 3x3 neighbourhood the same way) so results match.
+  For 2 of the 20 sites the two differ by one grid row: Elsinore (2.13 km
+  away rather than 2.06 km) and Skyport (1.69 km rather than 1.68 km).
+- **Imports.** `import grib` alone takes 8 s and 180 MB on the Pi (MetPy,
+  Herbie, pandas). Not part of this work, but it is in every cold start.
 
-- Location: `rust/` in this repo, a standalone Cargo binary (`grib-profile`).
-  The Docker image only copies `*.py` and `sites.tsv`, so nothing here affects
-  prod until we choose to wire it in.
-- Input: a cached GRIB2 subset (as written by the Python code) plus one or
-  more lat/lon points. Output: JSON shaped like `_decode_grib_fields`'
-  per-level `{shortName: value}` dict, plus `cone`/`lov` and the grid point's
-  lat/lon, so it can be compared value-for-value with Python.
-- Decode with the `grib` crate (pure Rust). Check which data representation
-  templates the HRRR/RRFS subsets use first (probably 5.3, complex packing
-  with spatial differencing; check for 5.40 JPEG2000, which needs openjpeg
-  and so a C compiler).
-- Index points with an LCC inverse projection computed from the grid
-  definition (Latin1/2, LoV, La1/Lo1, Dx/Dy), not a KD-tree. Assert it picks
-  the same grid point as Python's KD-tree for every site in `sites.tsv`.
-- Decode messages in parallel (rayon), one field in memory per worker.
-- Benchmark: same files and points, Python vs Rust, cold and warm page cache.
-  Use `/usr/bin/time -v` (or `getrusage` on the child) for user/sys CPU and
-  max RSS. Run on the Pi 5 pod, since that's where prod runs.
-- Correctness bar: identical grid-point index and values equal to float32
-  precision, for every field and every site in `sites.tsv`.
+The estimates this replaces predicted that step 1 would capture most of the
+memory win (true) and that Rust's decode CPU would be comparable to eccodes
+(true for the `grib` crate, not for a decoder written for these files).
 
-## Blocker: dev environment
+## Recommendation
 
-The pod (homelab k8s, image based on the bot's python:3.14-slim) has no Rust
-toolchain, no C compiler or linker, no libc dev files, and no root or sudo.
-`libeccodes.so.0` exists, but its headers and dev symlink don't. The public
-internet, crates.io/rustup, and the NOAA S3 bucket are reachable. Hardware:
-aarch64 Pi 5, 4 cores, 8 GB RAM. `/data` is local disk, 183 GB free, wiped on
-restart. `/home/app` is a persistent NAS volume.
+Take step 2 into the bot: have `grib.py` get its per-point values from
+`grib-profile` instead of `_load_fields`. At about half a second and under
+20 MB per subset, with nothing held between requests, that also makes the
+`.region.npz` crops, the `lru_cache`, `_full_decode_lock` and
+`clear_field_cache()` unnecessary.
 
-Needed: `rustc`/`cargo` (pinned stable, plus clippy/rustfmt), `build-essential`
-(gcc and libc6-dev), and `pkg-config`. Nice to have: `libeccodes-dev` (for 2b)
-and GNU `time`. `maturin` can go in a user venv
-(`python -m venv --system-site-packages`) with no image change.
+- Call it as a subprocess first (JSON on stdout). Process start is a few
+  milliseconds, against a build that needs only a Rust stage in the
+  Dockerfile. PyO3/maturin would save nothing measurable here.
+- Skip step 1 as a separate change: it would be superseded at once.
+- Skip step 2b (Rust calling libeccodes): the measurements already separate
+  the decoder's effect from the language's.
+- Step 3 (Rust download, replacing Herbie) is independent and network-bound.
+  Worth doing later for the 0.6 to 1.1 s per `.idx` lookup and to drop
+  Herbie and pandas from the import, not for CPU.
 
-Two options were put to the user; **they haven't chosen yet. Don't install
-anything until they do.** (They rejected an attempt to install rustup into
-home.)
-1. Recommended: add the tools to the pod image in the homelab repo (not
-   attached to this session):
-   ```dockerfile
-   RUN apt-get update && apt-get install -y --no-install-recommends \
-         build-essential pkg-config libeccodes-dev time \
-       && rm -rf /var/lib/apt/lists/*
-   ENV RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo \
-       PATH=/opt/rust/cargo/bin:$PATH CARGO_TARGET_DIR=/data/target
-   RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
-         --default-toolchain <pinned-stable> --no-modify-path \
-       && rustup component add clippy rustfmt \
-       && chown -R 10001:10001 /opt/rust
-   ```
-2. User-space: rustup into `~/.cargo` (persists on the NAS) with `zig cc` as
-   the linker in place of gcc. No eccodes headers.
+## Dev environment
+
+Resolved: the pod image now has Rust 1.100 (cargo, clippy, rustfmt), gcc,
+pkg-config, libeccodes-dev and GNU time. `CARGO_TARGET_DIR` is `/data/target`,
+so the binary is `/data/target/release/grib-profile`. `/data` is wiped when
+the pod restarts; refetch the test subsets with step 1 below.
 
 ## Next steps
 
-1. Get the user's decision on the dev environment and confirm the tools work
-   (`cargo new` plus build a hello world that links).
-2. Pull one HRRR and one RRFS run into `/data/cache` with the existing Python
-   (`SOUNDING_CACHE_DIR=/data/cache`, `grib.fetch_hrrr_profile(...)` for a
-   SoCal site). Record the Python baseline (step 0) on the Pi.
-3. Check the data representation templates in those subsets.
-4. Build the Rust CLI (step 2) and compare it against Python for correctness.
-5. Prototype the Python streaming change (step 1) and measure it.
-6. Fill in the table above with measured numbers and recommend which steps
-   to take. Open a PR (never push to `main`; see /etc/claude-code/CLAUDE.md).
+1. To reproduce: `cd rust && cargo build --release`, fetch a run into
+   `/data/cache` (`PYTHONPATH=. python -c "import grib;
+   grib.fetch_hrrr_profile(32.99, -117.12, None)"`, likewise
+   `fetch_rrfs_profile`), then `rust/bench/bench.sh /data/cache/*.grib2`
+   from the repo root.
+2. Get the user's go-ahead on the recommendation, and on whether to keep
+   Python's grid-point choice or switch to the true nearest point.
+3. Wire it in: `_decode_grib_fields` calls the binary; remove the region
+   crop, the field cache and their callers in `telegram_bot.py`. Check that
+   terrain (`_fetch_terrain_height`) and URMA (`fetch_urma_surface`) go
+   through the same path, so eccodes can be dropped from the image. URMA is
+   a different grid (2.5 km) and hasn't been run through the decoder yet.
+4. Add a Rust build stage to the `Dockerfile` (aarch64) and copy the binary
+   into the image. The workflows under `.github/workflows/` can't be edited
+   with the bot's token, so check that the existing image build needs no
+   change.
+5. Before shipping: drop the `grib` crate and `--decoder crate` (cross-check
+   only), and add decoder tests against a small committed GRIB2 fixture (one
+   surface message is about 1.7 MB) or a synthetic 5.3 message.
+6. Later, separately: step 3.
