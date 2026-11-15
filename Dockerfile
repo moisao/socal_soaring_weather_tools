@@ -32,6 +32,18 @@ RUN pip install --only-binary=:all: --no-binary=reverse_geocoder \
     && pip uninstall -y eccodeslib eckitlib
 
 
+# grib-profile, the GRIB2 decoder grib.py runs (rust/). No dependencies
+# beyond std, so this needs no network; for arm64 it compiles under
+# emulation, which a crate this small keeps short.
+FROM rust:1.100-slim-trixie AS grib-profile
+
+WORKDIR /src
+COPY rust/Cargo.toml rust/Cargo.lock ./
+COPY rust/src src
+RUN cargo build --release --locked --offline \
+    && cargo test --release --locked --offline
+
+
 FROM python:3.14-slim-trixie
 
 # tzdata: Simple_Sounding converts through real IANA zones (ZoneInfo).
@@ -58,6 +70,7 @@ RUN useradd --uid 10001 --create-home --home-dir /home/app app \
     && install -d -o app -g app /home/app/.cache /home/app/.cache/matplotlib
 
 COPY --from=deps /opt/venv /opt/venv
+COPY --from=grib-profile /src/target/release/grib-profile /usr/local/bin/
 
 WORKDIR /app/bot
 COPY *.py ./
@@ -85,7 +98,8 @@ USER 10001
 # like the eckit one above at build time, not on the first chat request.
 # Then build matplotlib's font cache (~12 s that would otherwise land on
 # every new pod's first start) and fail if Fira Sans isn't discoverable.
-RUN python -c "import grib, Simple_Sounding, telegram_bot" \
+RUN grib-profile --version \
+    && python -c "import grib, Simple_Sounding, telegram_bot" \
     && python -c "from matplotlib import font_manager as fm; fm.findfont('Fira Sans', fallback_to_default=False)"
 
 CMD ["python", "telegram_bot.py"]

@@ -10,3 +10,4 @@ __pycache__/
 *.jl
 *.sh
 *.md
+rust/target/

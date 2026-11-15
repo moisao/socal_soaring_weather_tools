@@ -2,27 +2,27 @@
 (HRRR, RRFS), plus the URMA surface analysis.
 
 Herbie resolves which run/source exists and parses the .idx sidecar
-into byte ranges; the actual fetch and the eccodes decode are done
-here. See thredds.py for the THREDDS-based global fallback, which
-shares none of this machinery."""
+into byte ranges; the actual fetch is done here, and the decode by
+grib-profile (rust/). See thredds.py for the THREDDS-based global
+fallback, which shares none of this machinery."""
 
+import json
 import math
 import os
-import tempfile
+import shutil
+import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
+from pathlib import Path
 
-import eccodes
 import metpy.calc as mpcalc
-import numpy as np
 import pandas as pd
 import requests
 from herbie import Herbie
 from metpy.units import units
 from requests.adapters import HTTPAdapter
-from scipy.spatial import cKDTree
 from urllib3.util.retry import Retry
 
 from config import CACHE_DIR
@@ -100,19 +100,6 @@ def _lcc_cone_constant(latin1, latin2):
                       / math.tan(math.radians(45 - latin2 / 2))))
 
 
-# The area a long-running caller serves, as (lat_min, lat_max, lon_min,
-# lon_max) in degrees -- the bot sets it around its named sites; None
-# everywhere else. See set_region().
-REGION = None
-# How far inside a region file's own edge a point has to be for that file
-# to answer it: any nearer and its nearest grid point could be one the
-# crop cut off. Two 3 km grid spacings.
-REGION_EDGE_DEG = 0.06
-
-# A full-grid decode holds ~1 GB, so only one runs at a time: the bot's
-# pre-warm thread and a request decoding at once could otherwise come to
-# twice that. Region files are small and skip this.
-_full_decode_lock = threading.Lock()
 # One lock per cache file, so two threads after the same file (a request
 # and the pre-warm) download it once between them rather than both
 # writing the same .part path.
@@ -125,190 +112,63 @@ def _path_lock(path):
         return _path_locks.setdefault(str(path), threading.Lock())
 
 
-def set_region(region):
-    """Also keep a crop of every subset decoded from now on, covering
-    `region` (lat_min, lat_max, lon_min, lon_max), beside its GRIB2 as
-    <stub>.region.npz; a point inside it is then decoded from that
-    instead of the whole grid. None turns it off.
-
-    NOAA serves no subregion of these models to download -- NOMADS'
-    grib filter has no RRFS at all and only 7 HRRR pressure levels, and
-    a GRIB2 message is only readable whole -- so this saves no
-    bandwidth. What it saves is the decode: a SoCal crop is ~5 MB
-    against ~1 GB of full-grid arrays, so a request for a run already
-    on disk loads in milliseconds and barely moves the bot's memory."""
-    global REGION
-    REGION = region
-
-
-def _region_path(grib_path):
-    return grib_path.with_suffix('.region.npz')
+@lru_cache(maxsize=1)
+def grib_profile_binary():
+    """Where grib-profile (the decoder under rust/) is: wherever
+    SOUNDING_GRIB_PROFILE says, else on PATH (where the Docker image
+    installs it), else this checkout's own `cargo build --release`."""
+    configured = os.environ.get('SOUNDING_GRIB_PROFILE')
+    if configured:
+        return configured
+    on_path = shutil.which('grib-profile')
+    if on_path:
+        return on_path
+    target_dir = os.environ.get('CARGO_TARGET_DIR') or Path(__file__).resolve().parent / 'rust' / 'target'
+    built = Path(target_dir) / 'release' / 'grib-profile'
+    if built.exists():
+        return str(built)
+    raise RuntimeError('grib-profile not found: run `cargo build --release` in rust/, '
+                       'or point SOUNDING_GRIB_PROFILE at the binary')
 
 
 def _decode_grib_fields(grib_path, lat, lon):
     """Decode a cached GRIB2 subset (from _fetch_grib_profile) into the
     per-level {shortName: value} dict the caller needs, at the grid point
-    nearest (lat, lon).
+    nearest (lat, lon), plus the grid's LCC cone constant and central
+    meridian. Every level's dict also carries that grid point as
+    '_lat'/'_lon' (longitude in 0-360, as the grid defines it).
 
-    eccodes' own codes_grib_find_nearest decodes a message's *entire*
-    field internally just to answer one point -- measured at ~60s of CPU
-    across a single RRFS run's ~125 messages on its ~1.9M-point North
-    America grid, and that cost repeats on every call even though the
-    field data is identical between calls for the same run (only the
-    query point differs). A plain values decode to full numpy arrays
-    instead takes ~3s for a whole RRFS run (225 messages, measured on
-    an M1), after which any point is a KD-tree query (sub-millisecond)
-    -- and _load_fields memoizes those arrays for a batch of points.
+    The decode itself is grib-profile, a small Rust program (rust/) run
+    once per call. It unpacks one message at a time straight to the one
+    value wanted and holds nothing the size of the grid, so a 185-message
+    subset costs about half a second and under 20 MB on a Raspberry Pi 5.
+    The eccodes decode this replaced unpacked every message to a
+    full-grid array and kept them all -- 17 to 22 s and 1.7 to 2.0 GB
+    for the same subset -- which then needed a memo, a lock around it and
+    a cropped copy on disk to be bearable. None of that is left: every
+    call decodes afresh.
 
-    Nothing decoded is written to disk. That used to be cached as a
-    compressed .fields.npz beside the GRIB2 subset, but it came out
-    twice the subset's size (657 vs 312 MB for one RRFS run), its zlib
-    pass took ~56s of single-threaded CPU on every cold fetch, and
-    loading it back was no faster than decoding the GRIB2 again
-    (2.95 vs 2.98s).
+    "Nearest" is by distance over the ground. It used to be a KD-tree
+    over (lat, lon) in degrees, which counts a degree of longitude as
+    much as one of latitude and so, at these latitudes, sometimes
+    preferred a point one row north or south of the truly nearest one.
 
-    The grid's lat/lon and the LCC cone constant/central meridian only
-    need decoding once (identical for every message sharing a grid
-    definition, which every message in one of these subsets does) --
-    not once per level/variable.
-
-    Read from the subset's region crop instead when it has one covering
-    (lat, lon) -- see set_region."""
-    with _path_lock(grib_path):
-        fields = _load_region(_region_path(grib_path), lat, lon)
-        if fields is None:
-            with _full_decode_lock:
-                fields = _load_fields(grib_path)
-    lats, lons, cone, lov, values, tree = fields
-    # lons is in eccodes' 0-360 convention (see the longitude-normalizing
-    # comment below) -- query with the same convention, or a -180..180
-    # input like -117 reads as numerically far from every real point in
-    # the grid's 225-299 range and returns nonsense (caught by exactly
-    # this: an early version of this query, without the % 360, matched
-    # coastal British Columbia for a San Diego-area query point).
-    _, idx = tree.query([lat, lon % 360])
-    nearest_lat, nearest_lon = float(lats[idx]), float(lons[idx])
+    A point off the model's grid raises, where the KD-tree would quietly
+    have answered with whichever edge point was least far away."""
+    result = subprocess.run(
+        [grib_profile_binary(), str(grib_path), '--point', f'{float(lat)!r},{float(lon)!r}'],
+        capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f'Decoding {grib_path.name} failed: {result.stderr.strip()}')
+    decoded = json.loads(result.stdout)
+    point = decoded['points'][0]
 
     levels = {}
-    for key, arr in values.items():
+    for key, value in point['values'].items():
         short_name, level_str = key.rsplit('_', 1)
-        level = int(level_str)
-        entry = levels.setdefault(level, {})
-        entry[short_name] = float(arr[idx])
-        if short_name in ('u', 'v', '10u', '10v'):
-            entry['_lat'], entry['_lon'] = nearest_lat, nearest_lon
-    return levels, cone, lov
-
-
-@lru_cache(maxsize=3)
-def _load_fields(grib_path):
-    """One cached GRIB2 subset's full field arrays, its grid, and a
-    KD-tree over that grid -- everything about a run that doesn't depend
-    on which point is being looked up.
-
-    Memoized because none of it does depend on the point: decoding the
-    arrays and building the tree measured ~3.6s for one RRFS run, and
-    a batch of sites against that same run was paying it once per site
-    for an answer that never changed. The per-point work left downstream
-    is a single tree query, ~0.2 ms.
-
-    maxsize is small deliberately -- these are big (a 25-level, 5-variable
-    RRFS run is ~950 MB of float32 once decompressed) -- but not 1, since
-    a single profile touches three files (isobaric, surface and, where
-    published, native), and a cache of 1 would evict between them and
-    memoize nothing. A long-lived process that isn't batching should call
-    clear_field_cache() when it's done rather than hold that."""
-    lats = lons = None
-    cone = lov = None
-    values = {}
-    with open(grib_path, 'rb') as f:
-        while True:
-            gid = eccodes.codes_grib_new_from_file(f)
-            if gid is None:
-                break
-            short_name = eccodes.codes_get(gid, 'shortName')
-            level = eccodes.codes_get(gid, 'level')
-            if lats is None:
-                lats = np.asarray(eccodes.codes_get_array(gid, 'latitudes'), dtype=np.float32)
-                lons = np.asarray(eccodes.codes_get_array(gid, 'longitudes'), dtype=np.float32)
-            values[f'{short_name}_{level}'] = np.asarray(
-                eccodes.codes_get_array(gid, 'values'), dtype=np.float32)
-            # eccodes names the wind components by level type: plain
-            # u/v on isobaric and hybrid levels, but 10u/10v for the
-            # fixed 10 m diagnostic winds (URMA and the models' own
-            # surface products). Both are the same grid-relative
-            # components, and either one carries the projection
-            # metadata this needs.
-            if short_name in ('u', 'v', '10u', '10v') and cone is None:
-                cone = _lcc_cone_constant(eccodes.codes_get(gid, 'Latin1InDegrees'),
-                                          eccodes.codes_get(gid, 'Latin2InDegrees'))
-                lov = eccodes.codes_get(gid, 'LoVInDegrees')
-            eccodes.codes_release(gid)
-
-    if REGION is not None:
-        _write_region(_region_path(grib_path), REGION, lats, lons, cone, lov, values)
-
-    tree = cKDTree(np.column_stack([lats, lons]))
-    return lats, lons, cone, lov, values, tree
-
-
-def _write_region(region_path, region, lats, lons, cone, lov, values):
-    """Save the part of a decoded subset inside `region` (see set_region).
-    Uncompressed: it's small enough that zlib would only cost time."""
-    lat_min, lat_max, lon_min, lon_max = region
-    # lons are 0-360 here (see _decode_grib_fields), the region -180..180.
-    inside = ((lats >= lat_min) & (lats <= lat_max)
-              & (lons >= lon_min % 360) & (lons <= lon_max % 360))
-    if not inside.any():
-        return
-    # .part + rename, as for the downloads; np.savez appends ".npz" to a
-    # path that lacks it but not to an open file, hence the file object.
-    tmp_path = region_path.with_suffix('.npz.part')
-    with open(tmp_path, 'wb') as tmp:
-        np.savez(tmp, latitudes=lats[inside], longitudes=lons[inside],
-                 cone=np.float32(cone), lov=np.float32(lov),
-                 **{key: arr[inside] for key, arr in values.items()})
-    tmp_path.rename(region_path)
-    _read_region.cache_clear()
-
-
-@lru_cache(maxsize=8)
-def _read_region(region_path):
-    """A region file's contents in _load_fields' shape, or None if there
-    is no such file. Memoized like _load_fields, but cheap to hold."""
-    if not region_path.exists():
-        return None
-    with np.load(region_path) as cached:
-        lats, lons = cached['latitudes'], cached['longitudes']
-        cone, lov = float(cached['cone']), float(cached['lov'])
-        values = {k: cached[k] for k in cached.files
-                  if k not in ('latitudes', 'longitudes', 'cone', 'lov')}
-    tree = cKDTree(np.column_stack([lats, lons]))
-    return lats, lons, cone, lov, values, tree
-
-
-def _load_region(region_path, lat, lon):
-    """_read_region's fields if they cover (lat, lon) with REGION_EDGE_DEG
-    to spare, else None -- the caller then decodes the full grid."""
-    fields = _read_region(region_path)
-    if fields is None:
-        return None
-    lats, lons = fields[0], fields[1]
-    lon = lon % 360
-    if not (lats.min() + REGION_EDGE_DEG <= lat <= lats.max() - REGION_EDGE_DEG
-            and lons.min() + REGION_EDGE_DEG <= lon <= lons.max() - REGION_EDGE_DEG):
-        return None
-    return fields
-
-
-def clear_field_cache():
-    """Drop the memoized field arrays and KD-trees (see _load_fields).
-
-    Worth calling from a long-running process that renders one profile at
-    a time -- the Telegram bot -- where the memo buys nothing across
-    requests but would otherwise pin ~1 GB for the life of the service."""
-    _load_fields.cache_clear()
-    _read_region.cache_clear()
+        entry = levels.setdefault(int(level_str), {'_lat': point['lat'], '_lon': point['lon']})
+        entry[short_name] = float(value)
+    return levels, decoded['cone'], decoded['lov']
 
 
 def _latest_available_run(model, max_tries=6):
@@ -432,46 +292,30 @@ def _fetch_terrain_height(model, lat, lon, max_tries=6):
     given model/grid -- it doesn't change run to run or with forecast
     lead -- so this is cached once per model rather than once per run
     the way the isobaric fields are."""
-    cache_path = CACHE_DIR / f'{model.upper()}_terrain.npz'
-    if cache_path.exists():
-        cached = np.load(cache_path)
-        lats, lons, values = cached['latitudes'], cached['longitudes'], cached['values']
-    else:
-        run_date = _latest_available_run(model, max_tries=max_tries)
-        h = Herbie(run_date.replace(tzinfo=None), model=model,
-                  product=SURFACE_PRODUCT[model], fxx=0, verbose=False)
-        df = h.inventory(search=r':HGT:surface:')
-        row = df.iloc[0]
-        start = int(row.start_byte)
-        end = None if pd.isna(row.end_byte) else int(row.end_byte)
-        range_hdr = f'bytes={start}-{end}' if end is not None else f'bytes={start}-'
-        r = requests.get(h.grib, headers={'Range': range_hdr}, timeout=30)
-        r.raise_for_status()
+    cache_path = CACHE_DIR / f'{model.upper()}_terrain.grib2'
+    with _path_lock(cache_path):
+        if not cache_path.exists():
+            run_date = _latest_available_run(model, max_tries=max_tries)
+            h = Herbie(run_date.replace(tzinfo=None), model=model,
+                      product=SURFACE_PRODUCT[model], fxx=0, verbose=False)
+            df = h.inventory(search=r':HGT:surface:')
+            row = df.iloc[0]
+            start = int(row.start_byte)
+            end = None if pd.isna(row.end_byte) else int(row.end_byte)
+            range_hdr = f'bytes={start}-{end}' if end is not None else f'bytes={start}-'
+            r = requests.get(h.grib, headers={'Range': range_hdr}, timeout=30)
+            r.raise_for_status()
 
-        fd, tmp_path = tempfile.mkstemp(suffix='.grib2')
-        try:
-            with open(fd, 'wb') as f:
-                f.write(r.content)
-            with open(tmp_path, 'rb') as f:
-                gid = eccodes.codes_grib_new_from_file(f)
-                lats = np.asarray(eccodes.codes_get_array(gid, 'latitudes'), dtype=np.float32)
-                lons = np.asarray(eccodes.codes_get_array(gid, 'longitudes'), dtype=np.float32)
-                values = np.asarray(eccodes.codes_get_array(gid, 'values'), dtype=np.float32)
-                eccodes.codes_release(gid)
-        finally:
-            os.unlink(tmp_path)
+            # .part + rename so a run interrupted mid-write can't leave a
+            # truncated cache file a later call mistakes for complete.
+            tmp_path = cache_path.with_suffix('.grib2.part')
+            tmp_path.write_bytes(r.content)
+            tmp_path.rename(cache_path)
 
-        # .part + rename so a run interrupted mid-write can't leave a
-        # truncated cache file a later call mistakes for complete (see
-        # the matching pattern in _decode_grib_fields).
-        tmp_cache = cache_path.with_suffix('.npz.part')
-        with open(tmp_cache, 'wb') as f:
-            np.savez_compressed(f, latitudes=lats, longitudes=lons, values=values)
-        tmp_cache.rename(cache_path)
-
-    tree = cKDTree(np.column_stack([lats, lons]))
-    _, idx = tree.query([lat, lon % 360])
-    return float(values[idx])
+    # Through the same decode as the profile's own fields, so it is the
+    # height of the same grid point.
+    levels, _, _ = _decode_grib_fields(cache_path, lat, lon)
+    return levels[0]['orog']
 
 
 def _fetch_surface_subset(model, cache_prefix, run_date, forecast_hour, session):
@@ -696,9 +540,9 @@ def _fetch_grib_profile(lat, lon, date, model, cache_prefix, forecast_hour=None,
     its byte ranges (.inventory()) -- the actual fetch below is a
     parallel ThreadPoolExecutor pull instead.
 
-    Each message is decoded with eccodes and reduced to its single
-    nearest grid point immediately (eccodes' own nearest-neighbor
-    search), so the full 2D field is never materialized.
+    Each message is reduced to its value at the nearest grid point as it
+    is decoded (see _decode_grib_fields), so the full 2D field is never
+    held.
 
     These models' u/v wind components are *grid-relative* (Lambert
     Conformal), not earth-relative -- plotted or converted to direction
@@ -893,8 +737,8 @@ def _fetch_grib_profile(lat, lon, date, model, cache_prefix, forecast_hour=None,
             'speed': math.hypot(u_earth, v_earth) * 1.9438445,  # m/s -> kt
             'direction': math.degrees(math.atan2(-u_earth, -v_earth)) % 360,
             'latitude': d['_lat'],
-            # eccodes reports HRRR/RRFS grid-point longitudes in 0-360
-            # convention -- normalize to -180..180 to match what
+            # The grid point's longitude comes back in the grid's own
+            # 0-360 convention -- normalize to -180..180 to match what
             # Open-Meteo/geocoding/everything else downstream expects.
             'longitude': ((d['_lon'] + 180) % 360) - 180,
         })
@@ -1009,9 +853,8 @@ def fetch_urma_surface(lat, lon, date=None, max_tries=12):
 
     # UGRD/VGRD rather than the WIND/WDIR the same file also carries,
     # even though those are earth-relative and would need no rotation:
-    # _decode_grib_fields reads the LCC cone constant/central meridian
-    # (and tags the matched grid point) off the u/v messages specifically,
-    # so a subset without them decodes to cone=lov=None and fails on save.
+    # they are what the models' own surface rows use (_fetch_surface_row),
+    # so the two are read and rotated the same way.
     search = (r':(?:HGT|PRES):surface:|:(?:TMP|DPT):2 m above ground:'
               r'|:(?:UGRD|VGRD):10 m above ground:')
 

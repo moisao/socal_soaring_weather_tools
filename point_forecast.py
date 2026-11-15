@@ -286,6 +286,13 @@ def _inventory(source, run, lead, product):
     return rows
 
 
+# The sidecar's key for decoded values. Named for how their grid point was
+# chosen: values kept under the old 'points' were read at the point nearest
+# in degrees, which isn't always the nearest (see _nearest_grid_point), so
+# they are left unread and decoded again.
+POINTS = 'nearest_points'
+
+
 class HourFile:
     """The cached messages of one (model, run, lead): a GRIB2 file that is
     only ever appended to, and a sidecar naming what is in it, in order.
@@ -307,11 +314,11 @@ class HourFile:
         stem = f'{source.cache_prefix}_{run:%Y%m%d_%HZ}_f{lead:03d}.point'
         self.grib_path = CACHE_DIR / f'{stem}.grib2'
         self.index_path = CACHE_DIR / f'{stem}.json'
-        self.index = {'size': 0, 'messages': [], 'absent': [], 'points': {}}
+        self.index = {'size': 0, 'messages': [], 'absent': [], POINTS: {}}
         try:
             index = json.loads(self.index_path.read_text())
             if self.grib_path.stat().st_size >= index['size']:
-                self.index = {'points': {}, **index}
+                self.index = {POINTS: {}, **index}
         except (OSError, ValueError, KeyError):
             pass
 
@@ -385,10 +392,8 @@ class HourFile:
         """decode() for several (lat, lon) at once, in their order.
 
         Decodes one message at a time and keeps one number per point from
-        each, so nothing the size of the grid outlives its own message --
-        unlike grib._load_fields, which holds a whole run in memory to
-        serve a batch of sites and has no reason to here. Several points
-        cost what one does: the whole-grid unpack (~11 ms a message) is
+        each, so nothing the size of the grid outlives its own message.
+        Several points cost what one does: the whole-grid unpack (~11 ms a message) is
         the work, and picking more values out of it is nothing.
 
         The numbers are kept in the sidecar, per point, so asking again
@@ -399,7 +404,7 @@ class HourFile:
         wanted = self.labels() if labels is None else set(labels)
         present = wanted & self.labels()
         keys = [f'{lat:.5f},{lon:.5f}' for lat, lon in points]
-        cached = [self.index['points'].get(key) or {'_times': {}} for key in keys]
+        cached = [self.index[POINTS].get(key) or {'_times': {}} for key in keys]
         todo = [i for i, point in enumerate(cached) if not present <= point.keys()]
         if todo:
             with open(self.grib_path, 'rb') as f:
@@ -436,7 +441,7 @@ class HourFile:
                     finally:
                         eccodes.codes_release(gid)
             for i in todo:
-                self.index['points'][keys[i]] = cached[i]
+                self.index[POINTS][keys[i]] = cached[i]
             self._save_index()
         return [{**{k: v for k, v in point.items() if k.startswith('_') and k != '_times'},
                  '_times': {k: v for k, v in point['_times'].items() if k in wanted},
@@ -456,9 +461,8 @@ def prime(plan, points):
 
 @lru_cache(maxsize=256)
 def _terrain_height(model, lat, lon):
-    """grib._fetch_terrain_height, memoized: it loads the model's whole
-    orography and builds a KD-tree over it on every call (~0.6 s), for an
-    answer that never changes."""
+    """grib._fetch_terrain_height, memoized: it decodes the model's
+    orography on every call, for an answer that never changes."""
     return grib._fetch_terrain_height(model, lat, lon)
 
 
@@ -477,11 +481,15 @@ def _nearest_grid_point(model, gid, lat, lon):
     if key not in _grid_points:
         lats = eccodes.codes_get_array(gid, 'latitudes')
         lons = eccodes.codes_get_array(gid, 'longitudes')
-        # Plain distance in degrees, longitude unscaled: the metric
-        # grib.py's KD-tree uses, so this lands on the grid point a
-        # sounding of the same site does.
-        dlon = (lons - lon + 180) % 360 - 180
-        index = int(np.argmin((lats - lat) ** 2 + dlon ** 2))
+        # Nearest over the ground (great-circle, as a haversine), which
+        # is also how grib.py's decode picks its point, so this lands on
+        # the grid point a sounding of the same site does. Distance in
+        # plain degrees doesn't: it counts a degree of longitude as much
+        # as one of latitude, and can prefer a neighbouring row.
+        half_dlat = np.radians(lats - lat) / 2
+        half_dlon = np.radians(lons - lon) / 2
+        index = int(np.argmin(np.sin(half_dlat) ** 2 + np.cos(np.radians(lat))
+                              * np.cos(np.radians(lats)) * np.sin(half_dlon) ** 2))
         if len(_grid_points) > 200:
             _grid_points.clear()
         _grid_points[key] = (index, float(lats[index]), float((lons[index] + 180) % 360 - 180))

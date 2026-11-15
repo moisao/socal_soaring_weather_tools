@@ -63,7 +63,8 @@ Four cases, checked in order:
 | File | |
 |---|---|
 | `Simple_Sounding.py` | Entry point: `main()`, the model dispatcher, CLI wiring |
-| `grib.py` | GRIB2 fetch + eccodes decode off S3 — HRRR, RRFS, URMA |
+| `grib.py` | GRIB2 fetch off S3 and decode (via `rust/`) — HRRR, RRFS, URMA |
+| `rust/` | `grib-profile`, the GRIB2 decoder `grib.py` runs: one message at a time, straight to the grid point asked for |
 | `thredds.py` | THREDDS/NCSS fetch — GFS |
 | `wyoming.py` | Observed radiosonde archive |
 | `skewt.py` | The Skew-T panel: traces, barbs, adiabats, parcel, MSL axis |
@@ -136,9 +137,11 @@ under-forecasts surface heating; it doesn't.
 
 Winds are rotated from grid-relative to true north using the Lambert
 Conformal cone constant and central meridian read from each GRIB
-message's own metadata. eccodes reports longitudes in 0-360, so lookups
-normalise to that convention — querying with a raw -180..180 value
-silently matches somewhere thousands of km away.
+message's own metadata.
+
+The grid point used is the one nearest over the ground, found by
+inverting the grid's projection. A point off the model's grid is an
+error, so the model chain moves on to the next model.
 
 ## Point forecast
 
@@ -243,8 +246,7 @@ Everything lands in `cache/` (git-ignored):
 | `<MODEL>_<run>_f<lead>.grib2` | Fetched GRIB2 subset |
 | `<...>.native.grib2` | Native levels |
 | `<...>.surface.grib2` | 2 m / 10 m / surface-pressure fields |
-| `<...>.region.npz` | The bot's sites' area, cropped out of any of those three once decoded — a few MB instead of ~1 GB to decode for the next site (`grib.set_region`) |
-| `<MODEL>_terrain.npz` | Orography — static, so cached once per model rather than per run |
+| `<MODEL>_terrain.grib2` | Orography — static, so cached once per model rather than per run |
 | `<MODEL>_<run>_f<lead>.point.grib2` | Point-forecast messages for that hour; appended to as other sites ask for other levels |
 | `<...>.point.json` | What that file holds, in order, and each site's values decoded from it — so a repeat request decodes nothing |
 | `point-forecast/PF_*.png` | Point-forecast tables as drawn, sent or not; the ones sent are copied into the archive |
@@ -356,15 +358,14 @@ newest launch as soon as the Wyoming archive has it, so a bare
 checks every 5 minutes, outside the render lock, and draws twice a day.
 
 `/site`'s `SOUNDING_PREWARM` is left off in the deployment: each new hour
-needs a new lead (~280 MB of RRFS), it decodes whole grids outside the
-render lock (~2 GiB peak, so one overlapping a `/site` request can reach
-the pod's memory limit), and a warm `/site` saves only ~10–15 s.
+needs a new lead (~280 MB of RRFS), and a warm `/site` saves only
+~10–15 s.
 
 No server offers these models cut to an area — NOMADS' grib filter has
 no RRFS and only 7 HRRR pressure levels — so every fetch is the whole
-grid. What does get cut to an area is what's kept decoded: the bot crops
-each subset to a box around `sites.tsv` (`.region.npz`), so later sites
-on that run read a few MB rather than decoding ~1 GB.
+grid. The decode doesn't hold it, though: `grib-profile` unpacks each
+message straight to the one grid point asked for, about half a second
+and under 20 MB for a run's 185 isobaric messages on a Raspberry Pi 5.
 
 Repeat requests are answered from earlier renders while those are still
 current (`replay.py`, index in `replay-index/` beside the images):
@@ -474,7 +475,9 @@ The image uses Debian's `libeccodes` rather than the `eccodeslib` wheel.
 That wheel's `eckitlib` dependency bundles its own `libproj`/`libsqlite3`,
 and on Linux, loading it alongside pyproj's copies crashes
 (`double free or corruption`) when `eccodes` is imported before
-`metpy.calc`, as `grib.py` does.
+`metpy.calc`. Only `point_forecast.py` still uses `eccodes`; `grib.py`'s
+decode is `grib-profile`, which the image builds from `rust/` and
+installs on `PATH`.
 
 ## Batch runs
 
@@ -525,3 +528,14 @@ Python 3.14 in `../.venv`. Key packages: `metpy`, `siphon`,
 
 `eccodes` needs the ECMWF C library present, and wants a real file on
 disk — it can't decode from an in-memory buffer.
+
+Soundings from HRRR, RRFS and URMA also need `grib-profile`, which has no
+dependencies beyond a Rust toolchain:
+
+```bash
+cd rust && cargo build --release
+```
+
+`grib.py` looks for it at `$SOUNDING_GRIB_PROFILE`, then on `PATH`, then
+in that build's output (`rust/target`, or `$CARGO_TARGET_DIR`).
+`rust/check_against_eccodes.py` compares it with eccodes on real files.
