@@ -128,7 +128,9 @@ One hour file through the binary alone, 20 sites: HRRR 59 messages
   of each model. `import herbie` imported `cfgrib`, which imported
   `eccodes`, so all three left the image together.
 - **AWS only.** Herbie fell back to NOMADS, Google and Azure; `noaa.py`
-  does not. Tracked as a GitHub issue.
+  does not. What that costs is written up in README.md ("AWS is the
+  only source") and at the top of `noaa.py`. A fallback would be a
+  second URL per model, tried when the first isn't there.
 - **Lookup times** (Pi 5, before and after): latest HRRR run 5.3 s to
   0.3 s; latest RRFS run 1.4 s to 0.3 s; a point forecast's plan for a
   day 4.8 s to 1.5 s (HRRR), 5.0 s to 1.7 s (RRFS); URMA analysis 7.3 s
