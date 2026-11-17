@@ -1,8 +1,9 @@
 # Rust GRIB path: plan and handoff
 
 Status as of 2026-11-17: `grib.py` and `point_forecast.py` both decode
-through `grib-profile` (this directory), and nothing in the bot calls
-eccodes. The eccodes decode, the region crops and the field cache are
+through `grib-profile` (this directory), and find their files with
+`noaa.py` in place of Herbie. The bot's image has neither eccodes nor
+Herbie. The eccodes decode, the region crops and the field cache are
 gone from `grib.py`, and the grid point is now the nearest over the ground.
 This file is the handoff for any agent continuing the work. Update it as you
 go.
@@ -118,11 +119,21 @@ One hour file through the binary alone, 20 sites: HRRR 59 messages
   is the same place, eccodes' arrays put the tie at an arbitrary
   longitude, and grib-profile takes the column nearest the longitude
   asked for.
-- **Herbie keeps eccodes in the image.** `import herbie` imports
-  `cfgrib`, which imports `eccodes` at import time. With eccodes blocked,
-  `import grib` fails. So `eccodes`, `libeccodes0` and the Dockerfile's
-  `eccodeslib` workaround stay until Herbie is replaced (below).
-
+- **Herbie is replaced by `noaa.py`** (repo root, Python: the work is
+  network round trips). It was used for three things: a file's URL,
+  whether it is posted (HEAD), and its `.idx` as byte ranges. Against
+  Herbie on live buckets: same URLs and inventory rows for 22 files
+  across the four models, and the same 79 cache files byte for byte
+  from a sounding of each model, a URMA analysis and a point forecast
+  of each model. `import herbie` imported `cfgrib`, which imported
+  `eccodes`, so all three left the image together.
+- **AWS only.** Herbie fell back to NOMADS, Google and Azure; `noaa.py`
+  does not. Tracked as a GitHub issue.
+- **Lookup times** (Pi 5, before and after): latest HRRR run 5.3 s to
+  0.3 s; latest RRFS run 1.4 s to 0.3 s; a point forecast's plan for a
+  day 4.8 s to 1.5 s (HRRR), 5.0 s to 1.7 s (RRFS); URMA analysis 7.3 s
+  to 2.2 s; a run that doesn't exist 5.3 s to 0.3 s. `import grib`
+  8.3 s to 7.6 s.
 - **Correctness.** At the 20 sites and at 300 random points spread over
   the grid, grib-profile and eccodes give the same grid point and
   bit-identical values on every file tried: HRRR isobaric, native, surface
@@ -148,26 +159,25 @@ One hour file through the binary alone, 20 sites: HRRR 59 messages
 - **Off the grid.** A place outside the model's grid is now an error from
   the decode, where the KD-tree returned the nearest edge point. The subset
   is still downloaded first.
-- **Imports.** `import grib` alone takes 8 s and 180 MB on the Pi (MetPy,
-  Herbie, pandas). Not part of this work, but it is in every cold start.
+- **Imports.** `import grib` alone takes 7.6 s on the Pi
+  (MetPy, pandas; Herbie was 0.7 s of it). Not part of this work, but it
+  is in every cold start.
 - **Open-Meteo has no timeout.** `Simple_Sounding.py`'s Open-Meteo request
   passes no `timeout`; during testing one stalled connection hung a render
   for over five minutes. Not changed here.
 
 ## Not done, in rough order of value
 
-1. Replace Herbie for run lookup and `.idx` parsing (0.6 to 1.1 s per
-   lookup). Network-bound, so a latency win rather than a CPU one. Could
-   be Python or Rust. It is also the last thing holding eccodes, cfgrib
-   and xarray in the image, and part of the 8 s `import grib`. Herbie is
-   used in `grib.py` and in `point_forecast.py` (`_herbie`, `_inventory`).
-2. A place off the grid could be rejected before the download, from the
+1. A place off the grid could be rejected before the download, from the
    grid definition alone.
+2. `import grib` (7.6 s) is in every cold start: MetPy and pandas.
 
 ## Dev environment
 
 The pod image has Rust 1.100 (cargo, clippy, rustfmt), gcc, pkg-config,
-libeccodes-dev and GNU time. `CARGO_TARGET_DIR` is `/data/target`, so the
+libeccodes-dev and GNU time. `check_against_eccodes.py` needs the
+`eccodes` Python package, which `requirements.txt` no longer lists; the
+pod's `/opt/venv` had it as of 2026-11-17. `CARGO_TARGET_DIR` is `/data/target`, so the
 binary is `/data/target/release/grib-profile`, and `grib.py` finds it there.
 `/data` is wiped when the pod restarts: rebuild with `cargo build --release`
 in `rust/`, and refetch test subsets with e.g. `PYTHONPATH=. python -c

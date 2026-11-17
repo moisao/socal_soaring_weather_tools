@@ -320,8 +320,31 @@ itself out of the way:
 - Checked against the eccodes decode it replaces on a day's files of
   each model at all 20 sites: every value the same double
   (`rust/check_against_eccodes.py --by-position`).
-- Nothing here calls eccodes any more. It stays installed because
-  `import herbie` imports it.
+- Nothing here calls eccodes any more.
+
+## Without Herbie
+
+- `noaa.py` does the three things Herbie was used for: where a run's
+  file is in NOAA's S3 bucket, whether it is posted, and its `.idx` as
+  byte ranges. Checked against Herbie on 22 posted files across HRRR,
+  RRFS, GFS and URMA (same URLs, same rows for every search the bot
+  makes) and 6 that don't exist (same answer). Soundings and point
+  forecasts fetched both ways produced the same 79 cache files, byte
+  for byte.
+- **AWS is now the only source.** Herbie went on to NOMADS, Google and
+  Azure when AWS had no such file; a run missing from AWS now counts as
+  not posted, whatever the mirrors have.
+- Lookups are quicker, on one kept-alive connection instead of a new
+  one each, and with no mirrors to walk on a miss. Measured on the Pi 5:
+  finding HRRR's latest run 5.3 s to 0.3 s, a point forecast's plan for
+  the day 4.8 s to 1.5 s, a URMA analysis 7.3 s to 2.2 s, a run that
+  doesn't exist 5.3 s to 0.3 s. They also time out now (30 s); Herbie's
+  had no limit.
+- `herbie-data` and `eccodes` are out of `requirements.txt`, and with
+  them `cfgrib`, `libeccodes0` and the `eccodeslib` workaround in the
+  Dockerfile. `import grib` went from 8.3 s to 7.6 s: most of it is
+  MetPy and pandas, which stay. `santa_ana.py` and
+  `rust/check_against_eccodes.py` need those packages installed by hand.
 
 ## Also found along the way
 

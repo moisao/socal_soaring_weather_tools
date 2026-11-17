@@ -1,9 +1,9 @@
 """Modeled vertical profiles decoded straight from NOAA GRIB2 files
 (HRRR, RRFS), plus the URMA surface analysis.
 
-Herbie resolves which run/source exists and parses the .idx sidecar
-into byte ranges; the actual fetch is done here, and the decode by
-grib-profile (rust/). See thredds.py for the THREDDS-based global
+noaa.py says where a run's file is, whether it is posted, and (from its
+.idx sidecar) which byte ranges hold which messages; the actual fetch is
+done here, and the decode by grib-profile (rust/). See thredds.py for the THREDDS-based global
 fallback, which shares none of this machinery."""
 
 import json
@@ -20,11 +20,11 @@ from pathlib import Path
 import metpy.calc as mpcalc
 import pandas as pd
 import requests
-from herbie import Herbie
 from metpy.units import units
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+import noaa
 from config import CACHE_DIR
 
 
@@ -86,6 +86,26 @@ def _fetch_session():
                           pool_maxsize=HRRR_FETCH_WORKERS, max_retries=retry)
     session.mount('https://', adapter)
     return session
+
+
+def _download_messages(url, messages, path, session, timeout):
+    """Fetch these messages (noaa.inventory's) of the GRIB2 file at `url`
+    by byte range, several at a time, into `path` in the order given.
+
+    Written to a .part path and renamed only once complete, so a run
+    interrupted mid-fetch can't leave a truncated file that a later call
+    mistakes for a valid, complete cache entry."""
+    def fetch(message):
+        r = session.get(url, headers={'Range': message.byte_range}, timeout=timeout)
+        r.raise_for_status()
+        return r.content
+
+    tmp_path = path.with_suffix('.grib2.part')
+    with ThreadPoolExecutor(max_workers=HRRR_FETCH_WORKERS) as ex:
+        with open(tmp_path, 'wb') as tmp:
+            for content in ex.map(fetch, messages):
+                tmp.write(content)
+    tmp_path.rename(path)
 
 
 def _lcc_cone_constant(latin1, latin2):
@@ -199,20 +219,18 @@ def _decode_grib_fields(grib_path, lat, lon):
 
 def _latest_available_run(model, max_tries=6):
     """The most recently posted run for an hourly model: the newest of
-    the current hour and the max_tries - 1 before it that Herbie finds
-    -- posting typically lags real time by an hour or two.
+    the current hour and the max_tries - 1 before it that is in the
+    bucket -- posting typically lags real time by an hour or two.
 
     The candidate hours are probed all at once rather than stepping back
-    one at a time: a miss costs ~1.1s (Herbie walks its mirrors before
-    giving up), and RRFS's 3-hourly off-cycle runs plus its posting lag
-    routinely meant three misses before a hit -- ~4s measured, now about
-    one probe's worth."""
+    one at a time: RRFS's 3-hourly off-cycle runs plus its posting lag
+    routinely mean three misses before a hit, and this way they cost
+    about one probe's worth between them."""
     now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     candidates = [now - timedelta(hours=i) for i in range(max_tries)]
 
     def _posted(run_date):
-        h = Herbie(run_date.replace(tzinfo=None), model=model, product='prs', fxx=0, verbose=False)
-        return h.grib is not None
+        return noaa.is_posted(model, run_date, 0, 'prs')
 
     with ThreadPoolExecutor(max_workers=max_tries) as ex:
         for run_date, posted in zip(candidates, ex.map(_posted, candidates)):
@@ -230,7 +248,7 @@ _run_posted_memo = {}
 
 # Beyond this many hourly candidates, newer_run_posted() stops looking and
 # answers True: a render that old is cheaper to redo than to keep proving
-# current at ~0.6 s a lookup.
+# current at a lookup each.
 MAX_NEWER_RUN_CANDIDATES = 12
 
 
@@ -240,13 +258,10 @@ def _run_posted(model, run_date, forecast_hour):
     now = datetime.now(timezone.utc)
     if posted or (checked_at is not None and now - checked_at < RUN_MISS_TTL):
         return posted
-    # priority='aws' keeps a miss to one lookup (~0.6 s) instead of walking
-    # every mirror Herbie knows about. A failed lookup counts as a miss:
-    # the caller then keeps what it has rather than failing outright.
+    # A failed lookup counts as a miss: the caller then keeps what it has
+    # rather than failing outright.
     try:
-        h = Herbie(run_date.replace(tzinfo=None), model=model, product='prs',
-                   fxx=forecast_hour, priority='aws', verbose=False)
-        posted = h.grib is not None
+        posted = noaa.is_posted(model, run_date, forecast_hour, 'prs')
     except Exception:
         posted = False
     if len(_run_posted_memo) > 10_000:
@@ -322,21 +337,12 @@ def _fetch_terrain_height(model, lat, lon, max_tries=6):
     with _path_lock(cache_path):
         if not cache_path.exists():
             run_date = _latest_available_run(model, max_tries=max_tries)
-            h = Herbie(run_date.replace(tzinfo=None), model=model,
-                      product=SURFACE_PRODUCT[model], fxx=0, verbose=False)
-            df = h.inventory(search=r':HGT:surface:')
-            row = df.iloc[0]
-            start = int(row.start_byte)
-            end = None if pd.isna(row.end_byte) else int(row.end_byte)
-            range_hdr = f'bytes={start}-{end}' if end is not None else f'bytes={start}-'
-            r = requests.get(h.grib, headers={'Range': range_hdr}, timeout=30)
-            r.raise_for_status()
-
-            # .part + rename so a run interrupted mid-write can't leave a
-            # truncated cache file a later call mistakes for complete.
-            tmp_path = cache_path.with_suffix('.grib2.part')
-            tmp_path.write_bytes(r.content)
-            tmp_path.rename(cache_path)
+            product = SURFACE_PRODUCT[model]
+            terrain = noaa.inventory(model, run_date, 0, product, search=r':HGT:surface:')[:1]
+            if not terrain:
+                raise RuntimeError(f'{model.upper()} {run_date:%Y-%m-%d %HZ} has no HGT:surface')
+            _download_messages(noaa.grib_url(model, run_date, 0, product), terrain,
+                               cache_path, requests, timeout=30)
 
     # Through the same decode as the profile's own fields, so it is the
     # height of the same grid point.
@@ -357,32 +363,17 @@ def _fetch_surface_subset(model, cache_prefix, run_date, forecast_hour, session)
     cache_path = CACHE_DIR / f'{cache_prefix}_{run_date:%Y%m%d_%HZ}_f{forecast_hour:02d}.surface.grib2'
     with _path_lock(cache_path):
         if not cache_path.exists():
-            h = Herbie(run_date.replace(tzinfo=None), model=model, product=product,
-                       fxx=forecast_hour, verbose=False)
-            if h.grib is None:
+            if not noaa.is_posted(model, run_date, forecast_hour, product):
                 return None
 
             search = (r':(?:TMP|DPT):2 m above ground:'
                       r'|:(?:UGRD|VGRD):10 m above ground:'
                       r'|:PRES:surface:')
-            inventory = h.inventory(search=search)
+            inventory = noaa.inventory(model, run_date, forecast_hour, product, search=search)
             if len(inventory) < 5:
                 return None
-
-            def _fetch_one(row):
-                start = int(row.start_byte)
-                end = None if pd.isna(row.end_byte) else int(row.end_byte)
-                range_hdr = f'bytes={start}-{end}' if end is not None else f'bytes={start}-'
-                r = session.get(h.grib, headers={'Range': range_hdr}, timeout=60)
-                r.raise_for_status()
-                return r.content
-
-            tmp_path = cache_path.with_suffix('.grib2.part')
-            with ThreadPoolExecutor(max_workers=HRRR_FETCH_WORKERS) as ex:
-                with open(tmp_path, 'wb') as tmp:
-                    for content in ex.map(_fetch_one, (row for _, row in inventory.iterrows())):
-                        tmp.write(content)
-            tmp_path.rename(cache_path)
+            _download_messages(noaa.grib_url(model, run_date, forecast_hour, product), inventory,
+                               cache_path, session, timeout=60)
     return cache_path
 
 
@@ -464,38 +455,23 @@ def _fetch_native_subset(model, cache_prefix, run_date, forecast_hour, session):
 
     # Cache is keyed the same way the isobaric fetch's is (model/run/lead,
     # not lat/lon) -- checked first so a run already on disk skips the
-    # Herbie network probe entirely, same as the isobaric path below.
+    # network probe entirely, same as the isobaric path below.
     cache_path = CACHE_DIR / f'{cache_prefix}_{run_date:%Y%m%d_%HZ}_f{forecast_hour:02d}.native.grib2'
     with _path_lock(cache_path):
         if not cache_path.exists():
-            h = Herbie(run_date.replace(tzinfo=None), model=model, product=product,
-                      fxx=forecast_hour, verbose=False)
-            if h.grib is None:
+            if not noaa.is_posted(model, run_date, forecast_hour, product):
                 _NATIVE_UNAVAILABLE.add(unavailable_key)
                 return None
 
             wanted_levels = '|'.join(str(lvl) for lvl in range(1, MAX_NATIVE_LEVEL + 1))
             search = rf':(?:PRES|HGT|TMP|SPFH|UGRD|VGRD):(?:{wanted_levels}) hybrid level:'
-            inventory = h.inventory(search=search)
+            inventory = noaa.inventory(model, run_date, forecast_hour, product, search=search)
             if len(inventory) < MAX_NATIVE_LEVEL * 6 * 0.9:
                 # missing more than expected -- treat as unavailable rather than guess
                 _NATIVE_UNAVAILABLE.add(unavailable_key)
                 return None
-
-            def _fetch_one(row):
-                start = int(row.start_byte)
-                end = None if pd.isna(row.end_byte) else int(row.end_byte)
-                range_hdr = f'bytes={start}-{end}' if end is not None else f'bytes={start}-'
-                r = session.get(h.grib, headers={'Range': range_hdr}, timeout=30)
-                r.raise_for_status()
-                return r.content
-
-            tmp_path = cache_path.with_suffix('.grib2.part')
-            with ThreadPoolExecutor(max_workers=HRRR_FETCH_WORKERS) as ex:
-                with open(tmp_path, 'wb') as tmp:
-                    for content in ex.map(_fetch_one, (row for _, row in inventory.iterrows())):
-                        tmp.write(content)
-            tmp_path.rename(cache_path)
+            _download_messages(noaa.grib_url(model, run_date, forecast_hour, product), inventory,
+                               cache_path, session, timeout=30)
     return cache_path
 
 
@@ -554,17 +530,11 @@ def _fetch_grib_profile(lat, lon, date, model, cache_prefix, forecast_hour=None,
     Lambert-Conformal, hourly GRIB2 model (HRRR or RRFS), pulled from
     NOAA's public AWS archive.
 
-    Herbie (the herbie-data package) resolves which model/source/run
-    actually exists and parses the run's .idx sidecar into byte ranges
-    for the requested variables/levels -- it knows the current URL
-    templates and source fallbacks (AWS/NOMADS/etc.) for a large model
-    registry, including RRFS's now-operational feed, so this doesn't
-    hardcode any of that. But Herbie's own .download() fetches matched
-    byte ranges one at a time; for a request this wide (~125 messages,
-    before trimming to fewer levels this was ~195) that took over 10
-    minutes in testing. So Herbie is used only to resolve the run and
-    its byte ranges (.inventory()) -- the actual fetch below is a
-    parallel ThreadPoolExecutor pull instead.
+    noaa.py says whether a run's file is in the bucket and parses its
+    .idx sidecar into byte ranges for the requested variables/levels.
+    The fetch below pulls those ranges in parallel: one at a time, a
+    request this wide (~125 messages, before trimming to fewer levels
+    this was ~195) took over 10 minutes in testing.
 
     Each message is reduced to its value at the nearest grid point as it
     is decoded (see _decode_grib_fields), so the full 2D field is never
@@ -687,9 +657,7 @@ def _fetch_grib_profile(lat, lon, date, model, cache_prefix, forecast_hour=None,
                     grib_path = candidate_path
                     break
 
-                h = Herbie(run_date.replace(tzinfo=None), model=model, product='prs',
-                          fxx=forecast_hour, verbose=False)
-                if h.grib is None:
+                if not noaa.is_posted(model, run_date, forecast_hour, 'prs'):
                     if hold_valid_time is not None:
                         # Step back to an older run and lengthen the lead by the
                         # same hour, so the valid time being asked for doesn't move.
@@ -701,34 +669,18 @@ def _fetch_grib_profile(lat, lon, date, model, cache_prefix, forecast_hour=None,
                                            f'f{forecast_hour:02d} forecast')
                     run_date -= timedelta(hours=1)
                     continue
-                url = h.grib
 
                 for fetch_subset in (_fetch_native_subset, _fetch_surface_subset):
                     prefetch.submit(fetch_subset, model, cache_prefix, run_date, forecast_hour,
                                     prefetch_session)
 
-                inventory = h.inventory(search=search)
+                inventory = noaa.inventory(model, run_date, forecast_hour, 'prs', search=search)
                 if len(inventory) < MIN_ISOBARIC_MESSAGES:
                     raise RuntimeError(f'{model.upper()} index missing expected messages for {run_date} '
                                        f'({len(inventory)} < {MIN_ISOBARIC_MESSAGES})')
 
-                def _fetch_one(row):
-                    start = int(row.start_byte)
-                    end = None if pd.isna(row.end_byte) else int(row.end_byte)
-                    range_hdr = f'bytes={start}-{end}' if end is not None else f'bytes={start}-'
-                    r = session.get(url, headers={'Range': range_hdr}, timeout=30)
-                    r.raise_for_status()
-                    return r.content
-
-                # Written to a .part path and renamed only once complete, so a
-                # run interrupted mid-fetch can't leave a truncated file that a
-                # later call mistakes for a valid, complete cache entry.
-                tmp_path = candidate_path.with_suffix('.grib2.part')
-                with ThreadPoolExecutor(max_workers=HRRR_FETCH_WORKERS) as ex:
-                    with open(tmp_path, 'wb') as tmp:
-                        for content in ex.map(_fetch_one, (row for _, row in inventory.iterrows())):
-                            tmp.write(content)
-                tmp_path.rename(candidate_path)
+                _download_messages(noaa.grib_url(model, run_date, forecast_hour, 'prs'),
+                                   inventory, candidate_path, session, timeout=30)
                 grib_path = candidate_path
                 break
         else:
@@ -826,7 +778,7 @@ def fetch_hrrr_profile(lat, lon, date, forecast_hour=None, run_datetime=None, ma
 def fetch_rrfs_profile(lat, lon, date, forecast_hour=None, run_datetime=None, max_tries=6):
     """Modeled vertical profile at the nearest RRFS (3km CONUS) grid
     point -- NOAA's next-generation HRRR/RAP successor, now operational
-    on noaa-rrfs-ops-pds (found via Herbie's model registry; an earlier,
+    on noaa-rrfs-ops-pds (an earlier,
     now-superseded RRFS bucket, noaa-rrfs-pds, holds only retrospective
     test-case archives and isn't used here). See _fetch_grib_profile for
     how the fetch actually works."""
@@ -891,31 +843,16 @@ def fetch_urma_surface(lat, lon, date=None, max_tries=12):
             grib_path = candidate_path
             break
 
-        h = Herbie(run_date.replace(tzinfo=None), model='urma', product='anl',
-                   fxx=0, verbose=False)
-        if h.grib is None:
+        if not noaa.is_posted('urma', run_date, 0, 'anl'):
             run_date -= timedelta(hours=1)
             continue
 
-        inventory = h.inventory(search=search)
+        inventory = noaa.inventory('urma', run_date, 0, 'anl', search=search)
         if len(inventory) < 6:
             run_date -= timedelta(hours=1)
             continue
-
-        def _fetch_one(row):
-            start = int(row.start_byte)
-            end = None if pd.isna(row.end_byte) else int(row.end_byte)
-            range_hdr = f'bytes={start}-{end}' if end is not None else f'bytes={start}-'
-            r = session.get(h.grib, headers={'Range': range_hdr}, timeout=60)
-            r.raise_for_status()
-            return r.content
-
-        tmp_path = candidate_path.with_suffix('.grib2.part')
-        with ThreadPoolExecutor(max_workers=HRRR_FETCH_WORKERS) as ex:
-            with open(tmp_path, 'wb') as tmp:
-                for content in ex.map(_fetch_one, (row for _, row in inventory.iterrows())):
-                    tmp.write(content)
-        tmp_path.rename(candidate_path)
+        _download_messages(noaa.grib_url('urma', run_date, 0, 'anl'), inventory,
+                           candidate_path, session, timeout=60)
         grib_path = candidate_path
         break
     else:

@@ -35,12 +35,12 @@ import numpy as np
 import pandas as pd
 import requests
 from dateutil import parser as dateutil_parser
-from herbie import Herbie
 from metpy.units import units
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 import grib
+import noaa
 from config import CACHE_DIR
 from skewt import MIXED_LAYER_DEPTH, make_msl_height_functions
 
@@ -56,7 +56,7 @@ ALTITUDE_STEP_FT = 250
 # live, and the ways the three differ that matter here.
 @dataclass(frozen=True)
 class Source:
-    model: str            # Herbie's name for it
+    model: str            # noaa.py's name for it
     label: str            # as shown on the forecast
     cache_prefix: str
     profile_product: str  # isobaric levels
@@ -152,20 +152,6 @@ _posted = {}
 # for the rest of the day's hours without a lookup each. Forgotten after
 # RUN_MISS_TTL, since a run still being posted reaches further by then.
 _missing_from = {}
-# Herbie objects from the probes, reused for the fetch that follows.
-_herbies = {}
-
-
-def _herbie(source, run, lead, product):
-    key = (source.model, run, lead, product)
-    if key not in _herbies:
-        if len(_herbies) > 500:
-            _herbies.clear()
-        # priority='aws': the byte-range fetch needs S3 anyway, and a miss
-        # then costs one lookup instead of a walk through every mirror.
-        _herbies[key] = Herbie(run.replace(tzinfo=None), model=source.model, product=product,
-                               fxx=lead, priority='aws', verbose=False)
-    return _herbies[key]
 
 
 def _is_posted(source, run, lead):
@@ -186,8 +172,8 @@ def _is_posted(source, run, lead):
     # isobaric file before its surface one.
     products = {source.profile_product, source.surface_product}
     try:
-        posted = all(herbie.grib is not None and herbie.idx is not None
-                     for herbie in (_herbie(source, run, lead, product) for product in products))
+        posted = all(noaa.is_posted(source.model, run, lead, product, index=True)
+                     for product in products)
     except Exception:
         posted = False
     if posted:
@@ -195,8 +181,6 @@ def _is_posted(source, run, lead):
             _posted.clear()
         _posted[key] = True
     else:
-        for product in products:
-            _herbies.pop((*key, product), None)
         if missing_lead is None or lead < missing_lead or now - checked_at >= grib.RUN_MISS_TTL:
             _missing_from[key[:2]] = (lead, now)
     return posted
@@ -269,9 +253,8 @@ def _inventory(source, run, lead, product):
     averages -- except GFS's sensible heat flux, which exists only as an
     average (see _instantaneous_flux), and precipitation, the total over
     the hour to this lead (RAIN_LABEL)."""
-    df = _herbie(source, run, lead, product).inventory()
     rows = {}
-    for row in df.itertuples():
+    for row in noaa.inventory(source.model, run, lead, product):
         label = f'{row.variable}:{row.level}'
         instantaneous = re.fullmatch(r'anl|\d+ hour fcst', row.forecast_time) is not None
         averaged_flux = (source.flux_averaged and label == FLUX_LABEL
@@ -348,17 +331,14 @@ class HourFile:
         for product, wanted in by_product.items():
             if not wanted:
                 continue
-            herbie = _herbie(self.source, self.run, self.lead, product)
-            if herbie.grib is None or herbie.idx is None:
+            if not noaa.is_posted(self.source.model, self.run, self.lead, product, index=True):
                 raise RuntimeError(f'{self.source.model.upper()} {self.run:%Y-%m-%d %HZ} '
                                    f'f{self.lead:02d} {product} is not posted')
             inventory = _inventory(self.source, self.run, self.lead, product)
             rows = [inventory[label] for label in sorted(wanted & inventory.keys())]
 
-            def fetch(row, url=herbie.grib):
-                end = '' if pd.isna(row.end_byte) else int(row.end_byte)
-                r = session.get(url, headers={'Range': f'bytes={int(row.start_byte)}-{end}'},
-                                timeout=60)
+            def fetch(row, url=noaa.grib_url(self.source.model, self.run, self.lead, product)):
+                r = session.get(url, headers={'Range': row.byte_range}, timeout=60)
                 r.raise_for_status()
                 return r.content
 
