@@ -1,7 +1,8 @@
 # Rust GRIB path: plan and handoff
 
-Status as of 2026-11-15: `grib.py` decodes through `grib-profile` (this
-directory). The eccodes decode, the region crops and the field cache are
+Status as of 2026-11-17: `grib.py` and `point_forecast.py` both decode
+through `grib-profile` (this directory), and nothing in the bot calls
+eccodes. The eccodes decode, the region crops and the field cache are
 gone from `grib.py`, and the grid point is now the nearest over the ground.
 This file is the handoff for any agent continuing the work. Update it as you
 go.
@@ -23,9 +24,13 @@ Decisions (agreed with the user):
 ## What is here
 
 - `grib-profile SUBSET.grib2 (--point LAT,LON | --sites sites.tsv)...
-  [--threads N]` prints JSON: `cone`, `lov`, and per point the grid index,
-  the grid point's lat/lon and `{shortName_level: value}` with eccodes'
-  names (`t_850`, `10u_10`, `sp_0`, `orog_0`...). No dependencies beyond std.
+  [--messages N,N...] [--threads N]` prints JSON: `cone`, `lov` (null on
+  a latitude/longitude grid), and per point the grid index, the grid
+  point's lat/lon and `{shortName_level: value}` with eccodes' names
+  (`t_850`, `10u_10`, `sp_0`, `orog_0`...), as float32. With `--messages`
+  the values are instead a list, one per message position asked for
+  (from 0), as the doubles they unpack to, and the file is read no
+  further than the last of them. No dependencies beyond std.
   - `src/grib2.rs`: a decoder for exactly what these subsets contain (one
     field per message, no bitmap, data representation templates 5.0 and
     5.3). It decodes straight to the wanted points, stops at the last one,
@@ -34,18 +39,27 @@ Decisions (agreed with the user):
   - `src/lambert.rs`: the grid point from inverting the Lambert Conformal
     projection in Section 3, then the 3x3 points around it compared by
     great-circle distance.
+  - `src/latlon.rs`: the same for a regular latitude/longitude grid
+    (template 3.0, GFS), by rounding, with the wrap at the first meridian.
+  - `src/grid.rs`: the two behind one type, picked by Section 3's
+    template.
   - `src/main.rs`: the CLI. Messages are decoded on a few threads, one
     message in memory per thread.
 - `grib._decode_grib_fields` runs it once per subset and point.
+  `grib.decode_messages` runs it with `--messages` for
+  `point_forecast.HourFile.decode_points`: once per hour file, for all
+  the points and labels not yet in the sidecar.
   `grib.grib_profile_binary()` finds it: `$SOUNDING_GRIB_PROFILE`, then
   `PATH` (the Docker image builds it in its own stage and installs it in
   `/usr/local/bin`), then this checkout's `cargo build --release`.
 - `check_against_eccodes.py`: runs the binary and eccodes on the same files
   and sites and compares grid index and every value as float32. The index
   on the eccodes side is brute force over eccodes' own lat/lon arrays, so it
-  checks the projection too.
-- `cargo test`: the projection against known HRRR grid points, and the
-  decoder against synthetic 5.0 and 5.3 messages.
+  checks the projection too. `--by-position` does the same through
+  `--messages`, comparing doubles; use it for `*.point.grib2` files.
+- `cargo test`: the projection against known HRRR grid points, the
+  latitude/longitude grid, and the decoder against synthetic 5.0 and 5.3
+  messages.
 
 ## Measurements
 
@@ -74,7 +88,40 @@ After wiring in, with one process doing HRRR, RRFS and URMA for all 20 sites
 Before, one cold `fetch_hrrr_profile` alone peaked at 3.55 GB. One full
 Skew-T render from cached files: 18 s, 327 MB peak.
 
+### Point forecasts (2026-11-17)
+
+One day at Little Black (11 or 12 hour files per model), files already
+fetched, sidecars emptied of decoded values. "Decode" is every
+`decode_points` call for one site; "forecast" is the whole
+`point_forecast.py` process, tables drawn. The pod was busy with other
+runs, so take these as rough; RRFS's decode ranged from 11 to 27 s
+between runs, with its 1.5 GB of files in and out of the page cache.
+
+| Model | Messages | Decode, eccodes | Decode, grib-profile | Forecast before | Forecast now |
+|---|---|---|---|---|---|
+| HRRR | 649 | 70 s | 4 s | 91 s, 336 MB | 21 s, 231 MB |
+| RRFS | 1221 | 146 s | 18 s | 129 s (with a 151 MB download), 333 MB | 30 s, 230 MB |
+| GFS | 784 | 59 s | 2 s | 78 s, 270 MB | 21 s, 250 MB |
+
+One hour file through the binary alone, 20 sites: HRRR 59 messages
+0.45 s and 9 MB, RRFS 111 messages 1.3 s and 16 MB, GFS 71 messages
+0.09 s and 10 MB.
+
 ## Findings
+
+- **Point forecast correctness.** On those 34 hour files at all 20
+  sites, the old eccodes decode and the new one give the same double for
+  every value, and grid points within 1e-13 degrees. On
+  GFS, 9 more places around the world (southern hemisphere, either side
+  of the first meridian, the date line, a near-tie between rows) agree
+  too. At the poles they differ, by design: every point of a pole's row
+  is the same place, eccodes' arrays put the tie at an arbitrary
+  longitude, and grib-profile takes the column nearest the longitude
+  asked for.
+- **Herbie keeps eccodes in the image.** `import herbie` imports
+  `cfgrib`, which imports `eccodes` at import time. With eccodes blocked,
+  `import grib` fails. So `eccodes`, `libeccodes0` and the Dockerfile's
+  `eccodeslib` workaround stay until Herbie is replaced (below).
 
 - **Correctness.** At the 20 sites and at 300 random points spread over
   the grid, grib-profile and eccodes give the same grid point and
@@ -109,15 +156,12 @@ Skew-T render from cached files: 18 s, 327 MB peak.
 
 ## Not done, in rough order of value
 
-1. `point_forecast.py` still decodes with eccodes
-   (`codes_get_double_elements`, a whole-grid unpack per message), so
-   `libeccodes` is still in the image. It names messages by their `.idx`
-   label rather than shortName and also reads GFS (a lat/lon grid, not
-   Lambert), so moving it needs grib-profile to report values by message
-   position and to know grid template 3.0.
-2. Replace Herbie for run lookup and `.idx` parsing (0.6 to 1.1 s per
-   lookup). Network-bound, so a latency win rather than a CPU one. Could be Python or Rust.
-3. A place off the grid could be rejected before the download, from the
+1. Replace Herbie for run lookup and `.idx` parsing (0.6 to 1.1 s per
+   lookup). Network-bound, so a latency win rather than a CPU one. Could
+   be Python or Rust. It is also the last thing holding eccodes, cfgrib
+   and xarray in the image, and part of the 8 s `import grib`. Herbie is
+   used in `grib.py` and in `point_forecast.py` (`_herbie`, `_inventory`).
+2. A place off the grid could be rejected before the download, from the
    grid definition alone.
 
 ## Dev environment

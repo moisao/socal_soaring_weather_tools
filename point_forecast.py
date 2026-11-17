@@ -30,7 +30,6 @@ from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import eccodes
 import metpy.calc as mpcalc
 import numpy as np
 import pandas as pd
@@ -288,8 +287,9 @@ def _inventory(source, run, lead, product):
 
 # The sidecar's key for decoded values. Named for how their grid point was
 # chosen: values kept under the old 'points' were read at the point nearest
-# in degrees, which isn't always the nearest (see _nearest_grid_point), so
-# they are left unread and decoded again.
+# in degrees, which isn't always the nearest over the ground (a degree of
+# longitude is shorter than one of latitude), so they are left unread and
+# decoded again.
 POINTS = 'nearest_points'
 
 
@@ -391,57 +391,42 @@ class HourFile:
     def decode_points(self, points, labels=None):
         """decode() for several (lat, lon) at once, in their order.
 
-        Decodes one message at a time and keeps one number per point from
-        each, so nothing the size of the grid outlives its own message.
-        Several points cost what one does: the whole-grid unpack (~11 ms a message) is
-        the work, and picking more values out of it is nothing.
+        The decode is grib-profile (rust/, through grib.decode_messages),
+        run once for all the points: it unpacks each message only as far
+        as the last value wanted and holds nothing the size of the grid,
+        a few milliseconds a message. The grid point is the nearest over the
+        ground, the one a sounding of the same site uses; a place off the
+        model's grid raises.
 
         The numbers are kept in the sidecar, per point, so asking again
-        decodes nothing: a day of messages was ~7 s of every repeat
-        request. A message's value at a point never changes, so they need
-        no invalidating; a label appended since is simply decoded the
-        next time it's asked for."""
+        decodes nothing. A message's value at a point never changes, so
+        they need no invalidating; a label appended since is simply
+        decoded the next time it's asked for."""
         wanted = self.labels() if labels is None else set(labels)
         present = wanted & self.labels()
         keys = [f'{lat:.5f},{lon:.5f}' for lat, lon in points]
         cached = [self.index[POINTS].get(key) or {'_times': {}} for key in keys]
         todo = [i for i, point in enumerate(cached) if not present <= point.keys()]
         if todo:
-            with open(self.grib_path, 'rb') as f:
-                for message in self.index['messages']:
-                    gid = eccodes.codes_grib_new_from_file(f)
-                    if gid is None:
-                        raise RuntimeError(f'{self.grib_path.name} is shorter than its index')
-                    try:
-                        label = message['label']
-                        if label not in wanted:
-                            continue
-                        need = [i for i in todo if label not in cached[i]]
-                        if not need:
-                            continue
-                        grid = [_nearest_grid_point(self.source.model, gid, *points[i])
-                                for i in need]
-                        values = eccodes.codes_get_double_elements(
-                            gid, 'values', [index for index, _, _ in grid])
-                        lambert = None
-                        for i, (_, grid_lat, grid_lon), value in zip(need, grid, values):
-                            point = cached[i]
-                            point['_lat'], point['_lon'] = grid_lat, grid_lon
-                            point[label] = float(value)
-                            point['_times'][label] = message['time']
-                            if '_cone' not in point:
-                                if lambert is None:
-                                    lambert = eccodes.codes_get(gid, 'gridType') == 'lambert' and (
-                                        grib._lcc_cone_constant(
-                                            eccodes.codes_get(gid, 'Latin1InDegrees'),
-                                            eccodes.codes_get(gid, 'Latin2InDegrees')),
-                                        eccodes.codes_get(gid, 'LoVInDegrees'))
-                                if lambert:
-                                    point['_cone'], point['_lov'] = lambert
-                    finally:
-                        eccodes.codes_release(gid)
-            for i in todo:
-                self.index[POINTS][keys[i]] = cached[i]
+            # Every message any of these points still lacks, for all of
+            # them: a value one already has costs nothing to read again.
+            lacking = set().union(*(present - cached[i].keys() for i in todo))
+            positions = {}
+            for position, message in enumerate(self.index['messages']):
+                if message['label'] in lacking:
+                    positions.setdefault(message['label'], position)
+            decoded = grib.decode_messages(self.grib_path, [points[i] for i in todo],
+                                           positions.values())
+            for i, grid_point in zip(todo, decoded['points']):
+                point = cached[i]
+                point['_lat'] = float(grid_point['lat'])
+                point['_lon'] = (grid_point['lon'] + 180.) % 360 - 180
+                if decoded['cone'] is not None:
+                    point['_cone'], point['_lov'] = decoded['cone'], decoded['lov']
+                for (label, position), value in zip(positions.items(), grid_point['values']):
+                    point[label] = float(value)
+                    point['_times'][label] = self.index['messages'][position]['time']
+                self.index[POINTS][keys[i]] = point
             self._save_index()
         return [{**{k: v for k, v in point.items() if k.startswith('_') and k != '_times'},
                  '_times': {k: v for k, v in point['_times'].items() if k in wanted},
@@ -453,8 +438,7 @@ def prime(plan, points):
     """Decode every message the plan's hour files hold, for all these
     points at once, so that forecasts for them after this one decode
     nothing they don't fetch themselves. For drawing many sites' days
-    in a row: separately, each site unpacks the same whole-grid messages
-    again (~10 s a site-day for RRFS)."""
+    in a row: one pass over each file rather than one per site."""
     for _, (run, lead) in plan.resolved:
         HourFile(plan.source, run, lead).decode_points(points)
 
@@ -468,32 +452,6 @@ def _terrain_height(model, lat, lon):
 
 def _surface_labels(source):
     return set(SURFACE_LABELS) | ({TERRAIN_LABEL} if source.terrain_in_file else set())
-
-
-# (model, grid size, lat, lon) -> (index, grid lat, grid lon). The index
-# is the same for every message on a grid, and finding it means decoding
-# the grid's two coordinate arrays.
-_grid_points = {}
-
-
-def _nearest_grid_point(model, gid, lat, lon):
-    key = (model, eccodes.codes_get(gid, 'numberOfDataPoints'), lat, lon)
-    if key not in _grid_points:
-        lats = eccodes.codes_get_array(gid, 'latitudes')
-        lons = eccodes.codes_get_array(gid, 'longitudes')
-        # Nearest over the ground (great-circle, as a haversine), which
-        # is also how grib.py's decode picks its point, so this lands on
-        # the grid point a sounding of the same site does. Distance in
-        # plain degrees doesn't: it counts a degree of longitude as much
-        # as one of latitude, and can prefer a neighbouring row.
-        half_dlat = np.radians(lats - lat) / 2
-        half_dlon = np.radians(lons - lon) / 2
-        index = int(np.argmin(np.sin(half_dlat) ** 2 + np.cos(np.radians(lat))
-                              * np.cos(np.radians(lats)) * np.sin(half_dlon) ** 2))
-        if len(_grid_points) > 200:
-            _grid_points.clear()
-        _grid_points[key] = (index, float(lats[index]), float((lons[index] + 180) % 360 - 180))
-    return _grid_points[key]
 
 
 def _level_labels(levels, humidity_levels):
