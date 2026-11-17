@@ -64,7 +64,7 @@ Four cases, checked in order:
 |---|---|
 | `Simple_Sounding.py` | Entry point: `main()`, the model dispatcher, CLI wiring |
 | `grib.py` | GRIB2 fetch off S3 and decode (via `rust/`) — HRRR, RRFS, URMA |
-| `rust/` | `grib-profile`, the GRIB2 decoder `grib.py` runs: one message at a time, straight to the grid point asked for |
+| `rust/` | `grib-profile`, the GRIB2 decoder `grib.py` and `point_forecast.py` run: one message at a time, straight to the grid point asked for |
 | `thredds.py` | THREDDS/NCSS fetch — GFS |
 | `wyoming.py` | Observed radiosonde archive |
 | `skewt.py` | The Skew-T panel: traces, barbs, adiabats, parcel, MSL axis |
@@ -475,9 +475,10 @@ The image uses Debian's `libeccodes` rather than the `eccodeslib` wheel.
 That wheel's `eckitlib` dependency bundles its own `libproj`/`libsqlite3`,
 and on Linux, loading it alongside pyproj's copies crashes
 (`double free or corruption`) when `eccodes` is imported before
-`metpy.calc`. Only `point_forecast.py` still uses `eccodes`; `grib.py`'s
-decode is `grib-profile`, which the image builds from `rust/` and
-installs on `PATH`.
+`metpy.calc`. Nothing here decodes with `eccodes` any more: `grib.py` and
+`point_forecast.py` both run `grib-profile`, which the image builds from
+`rust/` and installs on `PATH`. The library is still in the image
+because `import herbie` imports `cfgrib`, which imports `eccodes`.
 
 ## Batch runs
 
@@ -526,11 +527,13 @@ Python 3.14 in `../.venv`. Key packages: `metpy`, `siphon`,
 `requests`, `reverse_geocoder`, `python-dateutil`,
 `python-telegram-bot`.
 
-`eccodes` needs the ECMWF C library present, and wants a real file on
-disk — it can't decode from an in-memory buffer.
+`eccodes` needs the ECMWF C library present. It is there for Herbie,
+which imports it (through `cfgrib`) whether or not it is used, and for
+`rust/check_against_eccodes.py`.
 
-Soundings from HRRR, RRFS and URMA also need `grib-profile`, which has no
-dependencies beyond a Rust toolchain:
+Everything read from GRIB2 (HRRR, RRFS and URMA soundings, and point
+forecasts) is decoded by `grib-profile`, which has no dependencies
+beyond a Rust toolchain:
 
 ```bash
 cd rust && cargo build --release
@@ -538,4 +541,5 @@ cd rust && cargo build --release
 
 `grib.py` looks for it at `$SOUNDING_GRIB_PROFILE`, then on `PATH`, then
 in that build's output (`rust/target`, or `$CARGO_TARGET_DIR`).
-`rust/check_against_eccodes.py` compares it with eccodes on real files.
+`rust/check_against_eccodes.py` compares it with eccodes on real files
+(`--by-position` for a point forecast's).

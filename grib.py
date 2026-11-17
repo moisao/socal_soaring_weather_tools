@@ -131,6 +131,37 @@ def grib_profile_binary():
                        'or point SOUNDING_GRIB_PROFILE at the binary')
 
 
+def _run_grib_profile(grib_path, points, *options):
+    """grib-profile's output, parsed, for a cached GRIB2 file at these
+    (lat, lon) points."""
+    command = [grib_profile_binary(), str(grib_path), *options]
+    for lat, lon in points:
+        command += ['--point', f'{float(lat)!r},{float(lon)!r}']
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f'Decoding {Path(grib_path).name} failed: {result.stderr.strip()}')
+    return json.loads(result.stdout)
+
+
+def decode_messages(grib_path, points, positions):
+    """The values of some of a GRIB2 file's messages at the grid points
+    nearest each of `points` ((lat, lon) pairs), the messages named by
+    their position in the file, counting from 0. For a caller that knows
+    what it put where (point_forecast.HourFile), and so has no use for
+    the names _decode_grib_fields goes by.
+
+    Returns grib-profile's output: 'cone' and 'lov' (None on a grid that
+    is north-up already, like GFS's), and under 'points', in the order of
+    `points`, each one's grid point ('index', 'lat', 'lon' in 0-360) and
+    'values', one per position, in the order of `positions`. The values
+    are the doubles the messages unpack to, not narrowed to float32 as
+    _decode_grib_fields' are.
+
+    The file is read no further than the last message asked for, so
+    whatever follows it (a half-written append) does no harm."""
+    return _run_grib_profile(grib_path, points, '--messages', ','.join(map(str, positions)))
+
+
 def _decode_grib_fields(grib_path, lat, lon):
     """Decode a cached GRIB2 subset (from _fetch_grib_profile) into the
     per-level {shortName: value} dict the caller needs, at the grid point
@@ -155,12 +186,7 @@ def _decode_grib_fields(grib_path, lat, lon):
 
     A point off the model's grid raises, where the KD-tree would quietly
     have answered with whichever edge point was least far away."""
-    result = subprocess.run(
-        [grib_profile_binary(), str(grib_path), '--point', f'{float(lat)!r},{float(lon)!r}'],
-        capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f'Decoding {grib_path.name} failed: {result.stderr.strip()}')
-    decoded = json.loads(result.stdout)
+    decoded = _run_grib_profile(grib_path, [(lat, lon)])
     point = decoded['points'][0]
 
     levels = {}

@@ -1,6 +1,8 @@
 //! Values at the grid points nearest some places, from a GRIB2 subset as
-//! grib.py caches them (HRRR, RRFS, URMA), as JSON on stdout. grib.py's
-//! `_decode_grib_fields` runs this.
+//! grib.py and point_forecast.py cache them (HRRR, RRFS, URMA, GFS), as
+//! JSON on stdout. grib.py's `_decode_grib_fields` runs this for values
+//! by name, and its `decode_messages` (with `--messages`) for values by
+//! where their message is in the file.
 //!
 //! Messages are decoded one at a time, straight to the wanted points, so
 //! nothing the size of the grid is ever held: about half a second and
@@ -15,15 +17,17 @@ use std::os::unix::fs::FileExt;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use lambert::{GridPoint, LambertGrid};
+use grid::{Grid, GridPoint};
 
 mod grib2;
+mod grid;
 mod lambert;
+mod latlon;
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 const USAGE: &str = "usage: grib-profile SUBSET.grib2 (--point LAT,LON | --sites sites.tsv)... \
-                     [--threads N]";
+                     [--messages N,N...] [--threads N]";
 
 /// eccodes' shortName for the parameters grib.py asks for, which is what
 /// its callers look values up by. Anything else is named by its GRIB2
@@ -49,13 +53,14 @@ fn short_name(discipline: u8, category: u8, number: u8, surface_type: u8) -> Str
     name.to_string()
 }
 
-/// (offset, length) of every GRIB2 message in the file, from each one's
-/// Section 0.
-fn message_spans(file: &File) -> Result<Vec<(u64, usize)>> {
+/// (offset, length) of the GRIB2 messages in the file, from each one's
+/// Section 0: all of them, or only as many as `count`, leaving the rest
+/// of the file unread.
+fn message_spans(file: &File, count: Option<usize>) -> Result<Vec<(u64, usize)>> {
     let file_len = file.metadata()?.len();
     let mut spans = Vec::new();
     let mut offset = 0;
-    while offset < file_len {
+    while offset < file_len && count.is_none_or(|count| spans.len() < count) {
         let mut header = [0u8; 16];
         file.read_exact_at(&mut header, offset)?;
         if &header[..4] != b"GRIB" || header[7] != 2 {
@@ -73,19 +78,15 @@ fn message_spans(file: &File) -> Result<Vec<(u64, usize)>> {
 
 /// One decoded message, reduced to the wanted points.
 struct Extracted {
-    /// "shortName_level", e.g. "t_850".
-    key: String,
-    grid: LambertGrid,
-    values: Vec<f32>,
+    /// "shortName_level", e.g. "t_850"; None where messages are asked
+    /// for by position, and what they hold is the caller's business.
+    key: Option<String>,
+    grid: Grid,
+    values: Vec<f64>,
 }
 
-/// Read and decode one message, keeping only its values at `places`
-/// (lat, lon), in their order.
-fn extract(file: &File, (offset, len): (u64, usize), places: &[(f64, f64)]) -> Result<Extracted> {
-    let mut bytes = vec![0u8; len];
-    file.read_exact_at(&mut bytes, offset)?;
-    let message = grib2::Message::parse(&bytes)?;
-    let grid = LambertGrid::from_section3(message.grid)?;
+/// A message's "shortName_level".
+fn key(message: &grib2::Message) -> Result<String> {
     let product = message.product()?;
     // eccodes' `level`: hPa on isobaric surfaces, otherwise the surface's
     // own value (hybrid level number, metres above ground, 0 at the
@@ -101,6 +102,22 @@ fn extract(file: &File, (offset, len): (u64, usize), places: &[(f64, f64)]) -> R
         product.number,
         product.surface_type,
     );
+    Ok(format!("{name}_{}", level.round() as i64))
+}
+
+/// Read and decode one message, keeping only its values at `places`
+/// (lat, lon), in their order.
+fn extract(
+    file: &File,
+    (offset, len): (u64, usize),
+    places: &[(f64, f64)],
+    named: bool,
+) -> Result<Extracted> {
+    let mut bytes = vec![0u8; len];
+    file.read_exact_at(&mut bytes, offset)?;
+    let message = grib2::Message::parse(&bytes)?;
+    let grid = Grid::from_section3(message.grid)?;
+    let key = named.then(|| key(&message)).transpose()?;
 
     let indices = locate(&grid, places)?.into_iter().map(|point| point.index);
     let indices: Vec<usize> = indices.collect();
@@ -109,21 +126,17 @@ fn extract(file: &File, (offset, len): (u64, usize), places: &[(f64, f64)]) -> R
     let mut order: Vec<usize> = (0..indices.len()).collect();
     order.sort_unstable_by_key(|&n| indices[n]);
     let sorted: Vec<usize> = order.iter().map(|&n| indices[n]).collect();
-    let mut sorted_values = vec![f32::NAN; sorted.len()];
+    let mut sorted_values = vec![f64::NAN; sorted.len()];
     message.values_at(&sorted, &mut sorted_values)?;
-    let mut values = vec![f32::NAN; indices.len()];
+    let mut values = vec![f64::NAN; indices.len()];
     for (&n, value) in order.iter().zip(sorted_values) {
         values[n] = value;
     }
 
-    Ok(Extracted {
-        key: format!("{name}_{}", level.round() as i64),
-        grid,
-        values,
-    })
+    Ok(Extracted { key, grid, values })
 }
 
-fn locate(grid: &LambertGrid, places: &[(f64, f64)]) -> Result<Vec<GridPoint>> {
+fn locate(grid: &Grid, places: &[(f64, f64)]) -> Result<Vec<GridPoint>> {
     places
         .iter()
         .map(|&(lat, lon)| {
@@ -178,19 +191,24 @@ fn json_number(value: f64) -> String {
     }
 }
 
-/// The output: the grid's cone constant and central meridian (for
-/// turning its grid-relative winds to true north), and for each place
-/// its name, grid point and `{"shortName_level": value}`.
+/// The output: a Lambert grid's cone constant and central meridian (for
+/// turning its grid-relative winds to true north; null on a grid that is
+/// north-up already), and for each place its name, grid point and values:
+/// `{"shortName_level": value}`, narrowed to f32 as grib.py has always
+/// had them, or with `by_position` a list of the messages' values in the
+/// order they were asked for, as the doubles they were unpacked to.
 fn to_json(
-    grid: &LambertGrid,
+    grid: &Grid,
     names: &[String],
     points: &[GridPoint],
     extracted: &[Extracted],
+    by_position: bool,
 ) -> String {
+    let (cone, lov) = grid.cone_and_lov().unwrap_or((f64::NAN, f64::NAN));
     let mut out = format!(
         "{{\"cone\":{},\"lov\":{},\"messages\":{},\"points\":[",
-        json_number(grid.cone),
-        json_number(grid.lov_deg),
+        json_number(cone),
+        json_number(lov),
         extracted.len()
     );
     for (n, (name, point)) in names.iter().zip(points).enumerate() {
@@ -199,13 +217,22 @@ fn to_json(
         }
         write!(
             out,
-            "{{\"name\":{},\"index\":{},\"lat\":{},\"lon\":{},\"values\":{{",
+            "{{\"name\":{},\"index\":{},\"lat\":{},\"lon\":{},\"values\":",
             json_string(name),
             point.index,
             json_number(point.lat),
             json_number(point.lon)
         )
         .unwrap();
+        if by_position {
+            let values: Vec<String> = extracted
+                .iter()
+                .map(|message| json_number(message.values[n]))
+                .collect();
+            write!(out, "[{}]}}", values.join(",")).unwrap();
+            continue;
+        }
+        out.push('{');
         // A key that comes up twice keeps its last value, as it would
         // in the dict this is parsed into.
         let mut written = 0;
@@ -220,10 +247,11 @@ fn to_json(
                 out.push(',');
             }
             written += 1;
-            // Widened to f64 so the digits printed are the f32's own,
-            // not the shortest decimal that rounds to it.
-            let value = json_number(f64::from(message.values[n]));
-            write!(out, "{}:{value}", json_string(&message.key)).unwrap();
+            // Narrowed, then widened again so the digits printed are the
+            // f32's own, not the shortest decimal that rounds to it.
+            let value = json_number(f64::from(message.values[n] as f32));
+            let key = message.key.as_deref().unwrap_or_default();
+            write!(out, "{}:{value}", json_string(key)).unwrap();
         }
         out.push_str("}}");
     }
@@ -235,6 +263,7 @@ fn run() -> Result<()> {
     let mut grib_path = None;
     let mut sites = Vec::new();
     let mut threads = None;
+    let mut positions: Option<Vec<usize>> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(format!("{arg} needs a value"));
@@ -248,6 +277,11 @@ fn run() -> Result<()> {
                 let value = value()?;
                 let (lat, lon) = value.split_once(',').ok_or("--point takes LAT,LON")?;
                 sites.push((value.clone(), lat.parse()?, lon.parse()?));
+            }
+            "--messages" => {
+                let list: std::result::Result<Vec<usize>, _> =
+                    value()?.split(',').map(str::parse).collect();
+                positions = Some(list.map_err(|e| format!("--messages takes N,N...: {e}"))?);
             }
             "--threads" => threads = Some(value()?.parse::<usize>()?),
             _ if grib_path.is_none() && !arg.starts_with('-') => grib_path = Some(arg),
@@ -265,7 +299,21 @@ fn run() -> Result<()> {
     let places: Vec<(f64, f64)> = sites.iter().map(|&(_, lat, lon)| (lat, lon)).collect();
 
     let file = File::open(&grib_path).map_err(|e| format!("{grib_path}: {e}"))?;
-    let spans = message_spans(&file)?;
+    // With --messages, only those, in the order given, and no more of
+    // the file is looked at than it takes to find them: past its last
+    // whole message a file still being appended to may hold anything.
+    let spans = match &positions {
+        None => message_spans(&file, None)?,
+        Some(positions) => {
+            let count = positions.iter().max().map_or(0, |last| last + 1);
+            let spans = message_spans(&file, Some(count))?;
+            let span = |&n: &usize| -> Result<(u64, usize)> {
+                let span = spans.get(n).copied();
+                Ok(span.ok_or_else(|| format!("no message {n}: the file holds {}", spans.len()))?)
+            };
+            positions.iter().map(span).collect::<Result<_>>()?
+        }
+    };
 
     // Each worker takes the next message nobody has started, so at most
     // one message per worker is in memory at a time.
@@ -275,7 +323,7 @@ fn run() -> Result<()> {
         loop {
             let n = next.fetch_add(1, Ordering::Relaxed);
             let Some(&span) = spans.get(n) else { break };
-            done.push((n, extract(&file, span, &places)));
+            done.push((n, extract(&file, span, &places, positions.is_none())));
         }
         done
     };
@@ -288,7 +336,8 @@ fn run() -> Result<()> {
             .flat_map(|w| w.join().expect("worker panicked"))
             .collect()
     });
-    // Back into file order, which decides which message wins a repeated key.
+    // Back into the order asked for: the file's own, which decides which
+    // message wins a repeated key, or that of --messages.
     extracted.sort_unstable_by_key(|(n, _)| *n);
     let extracted: Vec<Extracted> = extracted
         .into_iter()
@@ -303,7 +352,13 @@ fn run() -> Result<()> {
     }
     println!(
         "{}",
-        to_json(grid, &names, &locate(grid, &places)?, &extracted)
+        to_json(
+            grid,
+            &names,
+            &locate(grid, &places)?,
+            &extracted,
+            positions.is_some()
+        )
     );
     Ok(())
 }

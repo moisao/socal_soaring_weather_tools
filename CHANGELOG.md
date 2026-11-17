@@ -310,6 +310,18 @@ itself out of the way:
   had kept for the old point are decoded again.
 - A point off the model's grid is now an error, so the chain falls
   through to the next model. It used to get the nearest edge point.
+- **Point forecasts decode the same way.** `HourFile.decode_points` runs
+  `grib-profile` once per hour file, asking for messages by their
+  position in the file (`--messages`), since it already knows what it
+  put where. `grib-profile` learned GFS's latitude/longitude grid for
+  it. Decoding a day's files for one site, on the Pi 5: HRRR 70 s to
+  4 s, RRFS 146 s to 18 s, GFS 59 s to 2 s. A whole forecast from files
+  already fetched: about 80 to 130 s before, 20 to 30 s now.
+- Checked against the eccodes decode it replaces on a day's files of
+  each model at all 20 sites: every value the same double
+  (`rust/check_against_eccodes.py --by-position`).
+- Nothing here calls eccodes any more. It stays installed because
+  `import herbie` imports it.
 
 ## Also found along the way
 

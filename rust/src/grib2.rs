@@ -3,8 +3,8 @@
 //! or complex packing with spatial differencing (5.3).
 //!
 //! The unpacking follows NCEP's g2c `comunpack`, and the scaling follows
-//! eccodes (double arithmetic, then narrowed to f32), so the values come
-//! out bit-for-bit the same as grib.py's.
+//! eccodes (the same double arithmetic in the same order), so the values
+//! come out bit-for-bit the same as its.
 
 use crate::Result;
 
@@ -118,7 +118,7 @@ impl<'a> Message<'a> {
     /// written to `out` in the same order. Decoding stops at the last
     /// wanted index and nothing is allocated, so the field as a whole is
     /// never held.
-    pub fn values_at(&self, wanted: &[usize], out: &mut [f32]) -> Result<()> {
+    pub fn values_at(&self, wanted: &[usize], out: &mut [f64]) -> Result<()> {
         let s = self.representation;
         if s.len() < 21 {
             return Err("short section 5".into());
@@ -131,8 +131,7 @@ impl<'a> Message<'a> {
         let reference = f64::from(f32::from_be_bytes(s[11..15].try_into().unwrap()));
         let binary_scale = power(signed(&s[15..17]), 2.0);
         let decimal_scale = power(-signed(&s[17..19]), 10.0);
-        let scale =
-            |packed: i64| ((packed as f64 * binary_scale + reference) * decimal_scale) as f32;
+        let scale = |packed: i64| (packed as f64 * binary_scale + reference) * decimal_scale;
         let bits = u32::from(s[19]);
         let data = &self.data[5..];
 
@@ -161,9 +160,9 @@ impl<'a> Message<'a> {
         &self,
         points: usize,
         reference_bits: u32,
-        scale: impl Fn(i64) -> f32,
+        scale: impl Fn(i64) -> f64,
         wanted: &[usize],
-        out: &mut [f32],
+        out: &mut [f64],
     ) -> Result<()> {
         let s = self.representation;
         if s.len() < 49 {
@@ -387,8 +386,8 @@ mod tests {
         s
     }
 
-    fn expected(packed: i64) -> f32 {
-        ((packed as f64 * 0.25 + 250.5) * (1.0 / 10.0)) as f32
+    fn expected(packed: i64) -> f64 {
+        (packed as f64 * 0.25 + 250.5) * (1.0 / 10.0)
     }
 
     /// Pack `field` with template 5.3 in groups of `group_length`, the
@@ -473,9 +472,9 @@ mod tests {
             let bytes = complex_message(&field, order, group_length);
             let message = Message::parse(&bytes).unwrap();
             let wanted: Vec<usize> = (0..field.len()).collect();
-            let mut out = vec![f32::NAN; wanted.len()];
+            let mut out = vec![f64::NAN; wanted.len()];
             message.values_at(&wanted, &mut out).unwrap();
-            let want: Vec<f32> = field.iter().map(|v| expected(*v)).collect();
+            let want: Vec<f64> = field.iter().map(|v| expected(*v)).collect();
             assert_eq!(out, want, "order {order}, groups of {group_length}");
         }
     }
@@ -486,7 +485,7 @@ mod tests {
         let bytes = complex_message(&field, 2, 7);
         let message = Message::parse(&bytes).unwrap();
         let wanted = [0, 1, 2, 350, 350, 998, 999];
-        let mut out = [f32::NAN; 7];
+        let mut out = [f64::NAN; 7];
         message.values_at(&wanted, &mut out).unwrap();
         assert_eq!(out.to_vec(), wanted.map(|n| expected(field[n])).to_vec());
         assert!(message.values_at(&[1000], &mut [0.0]).is_err());
@@ -500,7 +499,7 @@ mod tests {
         let bytes = message(&representation(field.len(), 0, 11), &writer.into_octets());
         let message = Message::parse(&bytes).unwrap();
         let wanted = [0, 7, 7, 49];
-        let mut out = [f32::NAN; 4];
+        let mut out = [f64::NAN; 4];
         message.values_at(&wanted, &mut out).unwrap();
         assert_eq!(out.to_vec(), wanted.map(|n| expected(field[n])).to_vec());
     }

@@ -5,6 +5,7 @@ use std::f64::consts::{FRAC_PI_2, FRAC_PI_4};
 
 use crate::Result;
 use crate::grib2::{signed, unsigned};
+use crate::grid::{GridPoint, nearest_of};
 
 /// A Lambert Conformal grid (GRIB2 grid definition template 3.30) on a
 /// spherical earth.
@@ -23,25 +24,6 @@ pub struct LambertGrid {
     /// the cone's apex.
     x0: f64,
     y0: f64,
-}
-
-/// A grid point: its index into a message's values, and where it is.
-#[derive(Debug, Clone, PartialEq)]
-pub struct GridPoint {
-    pub index: usize,
-    pub lat: f64,
-    /// 0 to 360, as the grid itself is defined.
-    pub lon: f64,
-}
-
-/// Great-circle distance between two points in degrees, as an angle in
-/// radians (haversine).
-fn angular_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let (lat1, lat2) = (lat1.to_radians(), lat2.to_radians());
-    let half_dlat = (lat2 - lat1) / 2.0;
-    let half_dlon = (lon2 - lon1).to_radians() / 2.0;
-    let h = half_dlat.sin().powi(2) + lat1.cos() * lat2.cos() * half_dlon.sin().powi(2);
-    2.0 * h.sqrt().asin()
 }
 
 impl LambertGrid {
@@ -138,24 +120,19 @@ impl LambertGrid {
             return None;
         }
         let (ci, cj) = (ci as usize, cj as usize);
-        let mut best: Option<(f64, GridPoint)> = None;
-        for j in cj.saturating_sub(1)..=(cj + 1).min(self.ny - 1) {
-            for i in ci.saturating_sub(1)..=(ci + 1).min(self.nx - 1) {
+        let rows = cj.saturating_sub(1)..=(cj + 1).min(self.ny - 1);
+        let columns = ci.saturating_sub(1)..=(ci + 1).min(self.nx - 1);
+        let candidates = rows.flat_map(|j| {
+            columns.clone().map(move |i| {
                 let (lat, lon) = self.lat_lon(i, j);
-                let distance = angular_distance(lat_deg, lon_deg, lat, lon);
-                if best.as_ref().is_none_or(|(d, _)| distance < *d) {
-                    best = Some((
-                        distance,
-                        GridPoint {
-                            index: j * self.nx + i,
-                            lat,
-                            lon,
-                        },
-                    ));
+                GridPoint {
+                    index: j * self.nx + i,
+                    lat,
+                    lon,
                 }
-            }
-        }
-        best.map(|(_, point)| point)
+            })
+        });
+        nearest_of(lat_deg, lon_deg, candidates)
     }
 }
 
