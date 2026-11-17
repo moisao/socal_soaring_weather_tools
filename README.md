@@ -13,7 +13,7 @@ the working directory.
 
 ## Human Note and Attribution
 
-Guided by me through claude, using examples from MetPy's excellent documentation. Herbie is used to pull raw GRIB data.
+Guided by me through claude, using examples from MetPy's excellent documentation. Herbie pulled the raw GRIB data until `noaa.py` took over the little of it that was used.
 
 
 ## Quick start
@@ -64,6 +64,7 @@ Four cases, checked in order:
 |---|---|
 | `Simple_Sounding.py` | Entry point: `main()`, the model dispatcher, CLI wiring |
 | `grib.py` | GRIB2 fetch off S3 and decode (via `rust/`) — HRRR, RRFS, URMA |
+| `noaa.py` | Where NOAA's GRIB2 files are on S3, whether a run is posted, and its `.idx` as byte ranges |
 | `rust/` | `grib-profile`, the GRIB2 decoder `grib.py` and `point_forecast.py` run: one message at a time, straight to the grid point asked for |
 | `thredds.py` | THREDDS/NCSS fetch — GFS |
 | `wyoming.py` | Observed radiosonde archive |
@@ -96,10 +97,17 @@ the output path stub — so importing this module doesn't render anything.
 | URMA | `noaa-urma-pds` | 2.5 km | Surface analysis only — see below |
 | Wyoming | siphon | — | Observed radiosondes |
 
-Herbie is used only to resolve which run/source exists and to parse the
-`.idx` sidecar into byte ranges. The fetch is a parallel range-request
-pull, since Herbie's own downloader is sequential and was taking over ten
-minutes for a request this wide.
+`noaa.py` knows where each model's files are in NOAA's S3 buckets, asks
+whether a run is posted, and parses the `.idx` sidecar into byte ranges.
+The fetch is a parallel range-request pull.
+
+**AWS is the only source.** Herbie, which did this before, fell back to
+NOMADS, Google and Azure when a file wasn't on AWS. Now a run that is
+missing from AWS counts as not posted, even if a mirror has it: the bot
+uses an older run or the next model, as it does for any run that isn't
+up yet. In an S3 outage, modeled soundings and point forecasts from
+HRRR, RRFS, GFS (point forecasts only) and URMA are unavailable until it
+ends.
 
 `fetch_urma_surface()` exists in `grib.py` but is **deliberately not
 wired into anything**. URMA is a 2-D analysis — no vertical levels at
@@ -471,14 +479,9 @@ which default to the usual locations when unset. Nothing prunes `/data`,
 so it grows by roughly 300 MB per RRFS lead fetched (about 430 MB per
 HRRR lead).
 
-The image uses Debian's `libeccodes` rather than the `eccodeslib` wheel.
-That wheel's `eckitlib` dependency bundles its own `libproj`/`libsqlite3`,
-and on Linux, loading it alongside pyproj's copies crashes
-(`double free or corruption`) when `eccodes` is imported before
-`metpy.calc`. Nothing here decodes with `eccodes` any more: `grib.py` and
-`point_forecast.py` both run `grib-profile`, which the image builds from
-`rust/` and installs on `PATH`. The library is still in the image
-because `import herbie` imports `cfgrib`, which imports `eccodes`.
+The image has no `eccodes` and no Herbie. `grib.py` and
+`point_forecast.py` decode with `grib-profile`, which the image builds
+from `rust/` and installs on `PATH`, and find their files with `noaa.py`.
 
 ## Batch runs
 
@@ -522,14 +525,13 @@ because `import herbie` imports `cfgrib`, which imports `eccodes`.
 
 ## Dependencies
 
-Python 3.14 in `../.venv`. Key packages: `metpy`, `siphon`,
-`herbie-data`, `eccodes`, `numpy`, `pandas`, `scipy`, `matplotlib`,
-`requests`, `reverse_geocoder`, `python-dateutil`,
-`python-telegram-bot`.
+Python 3.14 in `../.venv`. Key packages: `metpy`, `siphon`, `numpy`,
+`pandas`, `scipy`, `matplotlib`, `requests`, `reverse_geocoder`,
+`python-dateutil`, `python-telegram-bot`.
 
-`eccodes` needs the ECMWF C library present. It is there for Herbie,
-which imports it (through `cfgrib`) whether or not it is used, and for
-`rust/check_against_eccodes.py`.
+Two scripts need a package `requirements.txt` leaves out, because the
+bot doesn't: `rust/check_against_eccodes.py` needs `eccodes` (and the
+ECMWF C library under it), and `santa_ana.py` needs `herbie-data`.
 
 Everything read from GRIB2 (HRRR, RRFS and URMA soundings, and point
 forecasts) is decoded by `grib-profile`, which has no dependencies

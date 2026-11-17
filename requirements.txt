@@ -1,10 +1,11 @@
 # Runtime dependencies for the Telegram bot / Simple_Sounding.py.
 # Pinned so container builds are reproducible; every package here has a
 # prebuilt cp314 manylinux wheel for x86_64 and aarch64 (or is pure
-# Python), so the image builds without a compiler. The Dockerfile swaps
-# herbie-data's eccodeslib wheel for Debian's libeccodes -- see there.
-eccodes==2.48.0
-herbie-data==2026.9.1
+# Python), so the image builds without a compiler.
+#
+# Not here, because the bot doesn't use them: eccodes, which
+# rust/check_against_eccodes.py needs, and herbie-data, which
+# santa_ana.py needs.
 matplotlib==3.11.2
 metpy==1.7.1
 numpy==2.5.3

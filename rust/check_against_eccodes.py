@@ -11,8 +11,9 @@ than by name, and compared to the last bit of the double they unpack to.
 That is the way to check a point forecast's files (*.point.grib2), whose
 fields grib-profile mostly has no name for, GFS's among them.
 
-Exits non-zero on any difference. Run from the repo root, with
-grib-profile built (`cargo build --release` in rust/) or on PATH.
+Exits non-zero on any difference. Needs eccodes (the Python package and
+the ECMWF library under it), which is not in requirements.txt: nothing
+else here uses it. Run from the repo root, with grib-profile built (`cargo build --release` in rust/) or on PATH.
 """
 import argparse
 import json

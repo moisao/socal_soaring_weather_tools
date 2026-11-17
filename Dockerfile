@@ -21,18 +21,11 @@ COPY requirements.txt /tmp/requirements.txt
 # --only-binary for everything except reverse_geocoder, which only ships
 # an sdist (pure Python) -- anything else falling back to a source build
 # means a wheel is missing for this platform and should fail loudly.
-#
-# eccodeslib/eckitlib (hard deps of herbie-data) are removed again: eckitlib
-# bundles its own libproj + libsqlite3, and with pyproj's copies in the
-# same process, `import eccodes` before `import metpy.calc` (grib.py's
-# order) dies with "double free or corruption". Without the wheel, the
-# eccodes bindings fall back to the system libeccodes (runtime stage).
 RUN pip install --only-binary=:all: --no-binary=reverse_geocoder \
-        -r /tmp/requirements.txt \
-    && pip uninstall -y eccodeslib eckitlib
+        -r /tmp/requirements.txt
 
 
-# grib-profile, the GRIB2 decoder grib.py runs (rust/). No dependencies
+# grib-profile, the GRIB2 decoder grib.py and point_forecast.py run (rust/). No dependencies
 # beyond std, so this needs no network; for arm64 it compiles under
 # emulation, which a crate this small keeps short.
 FROM rust:1.100-slim-trixie AS grib-profile
@@ -47,10 +40,8 @@ RUN cargo build --release --locked --offline \
 FROM python:3.14-slim-trixie
 
 # tzdata: Simple_Sounding converts through real IANA zones (ZoneInfo).
-# libeccodes0: Debian's build has no eckit/PROJ, so it can't clash with
-# pyproj (see the deps stage).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tzdata libeccodes0 \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # Fira Sans is the plots' font.family (Simple_Sounding.py); Debian doesn't
@@ -87,19 +78,18 @@ ENV PATH=/opt/venv/bin:$PATH \
     MALLOC_ARENA_MAX=2 \
     SOUNDING_CACHE_DIR=/data/cache \
     SOUNDING_OUTPUT_DIR=/data/out \
-    SOUNDING_SITES_FILE=/app/sites.tsv \
-    ECCODES_PYTHON_USE_FINDLIBS=1
+    SOUNDING_SITES_FILE=/app/sites.tsv
 
 RUN mkdir -p /data/cache /data/out && chown -R app:app /data
 VOLUME ["/data"]
 
 USER 10001
-# Import the bot's modules in its own order: catches native-library clashes
-# like the eckit one above at build time, not on the first chat request.
+# Import the bot's modules in its own order: catches a missing package or
+# a native-library clash at build time, not on the first chat request.
 # Then build matplotlib's font cache (~12 s that would otherwise land on
 # every new pod's first start) and fail if Fira Sans isn't discoverable.
 RUN grib-profile --version \
-    && python -c "import grib, Simple_Sounding, telegram_bot" \
+    && python -c "import grib, Simple_Sounding, point_forecast, telegram_bot" \
     && python -c "from matplotlib import font_manager as fm; fm.findfont('Fira Sans', fallback_to_default=False)"
 
 CMD ["python", "telegram_bot.py"]

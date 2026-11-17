@@ -5,6 +5,9 @@ Usage:
   python hrrr_pressure_diff.py               # defaults to hrrr
   python hrrr_pressure_diff.py --model gfs
   python hrrr_pressure_diff.py --model nam
+
+Needs herbie-data, which is not in requirements.txt: nothing else here
+uses it, and the bot's image is built without it.
 """
 
 import argparse
